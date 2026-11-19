@@ -1,0 +1,19 @@
+# 设计文档（本地保留，不入库）
+docagent-design*.md
+
+# Skill 分发内容（本地保留，不入库）
+合规审核Skill-分发包/
+
+# 通用开发排除项
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.log
+.DS_Store
