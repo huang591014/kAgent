@@ -6,13 +6,13 @@
 */
 
 import { generateText } from "ai";
-import type { ModelMessage } from "ai";
+import type { LanguageModel, ModelMessage } from "ai";
 import { config } from "../config.js";
 import type { Db, TaskRow } from "../db.js";
-import { newBatchId } from "../ids.js";
+import { newBatchId, newRequestId } from "../ids.js";
 import { determineOutcome, composeConclusion } from "../outcome.js";
 import type { MaterialIssue, PapersDoc, StoredMessage, TaskUsage } from "../types.js";
-import { coverageStats, validatePapers } from "../papers.js";
+import { coverageStats, enforceActiveScope, validatePapers, type ActiveScope } from "../papers.js";
 import type { SkillRegistry } from "../skills/registry.js";
 import type { OpenSearchRetrieval } from "../opensearch.js";
 import { pipeline, type DocVersionStatus } from "../pipelineClient.js";
@@ -29,6 +29,8 @@ export interface RunnerDeps {
   activeRuns: Map<string, AbortController>;
   /** 调度器回调：本任务结束后触发下一轮调度 */
   onSettled?: (taskId: string) => void;
+  /** 模型工厂（测试注入替身；缺省用内网端点） */
+  modelFactory?: () => LanguageModel;
 }
 
 const requestInputSchema = z.object({
@@ -48,15 +50,18 @@ class CancelledError extends Error {
 
 export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
   const { db } = deps;
-  const task = db.getTask(taskId);
-  if (!task) return;
-  if (["completed", "failed", "cancelled"].includes(task.status)) return;
-
   const controller = new AbortController();
   deps.activeRuns.set(taskId, controller);
+
+  // 原子领取（C1）：仅当任务仍为 queued 时占用执行槽并分配批次，防止并发派发双跑
   const batch = newBatchId();
+  const claim = db.claimTask(taskId, batch);
+  if (!claim.claimed || !claim.task) {
+    deps.activeRuns.delete(taskId);
+    return;
+  }
+  const task = claim.task;
   const startedAt = Date.now();
-  db.updateTask(taskId, { status: "running", current_batch: batch, status_reason: null });
 
   const materials = db.latestMaterials(taskId).map((m) => ({
     doc_id: m.doc_id,
@@ -74,6 +79,7 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
     retrieval: deps.retrieval,
     docStatusCache: new Map(),
     papers: loadPapers(db, taskId),
+    activeScope: db.getActiveScope(taskId, task.input_revision),
   };
 
   const usage = loadUsage(task.usage);
@@ -115,7 +121,7 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
       const fitted = fitMessagesToBudget(messages);
       const modelMessages = toModelMessages(fitted.messages);
       const result = await generateText({
-        model: chatModel(),
+        model: deps.modelFactory ? deps.modelFactory() : chatModel(),
         system: buildSystemPrompt(deps, ctx),
         messages: modelMessages,
         tools: toolSchemas,
@@ -145,18 +151,20 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
           : {}),
       });
 
-      // ===== 工具调用处理 =====
+      // ===== 工具调用处理：每个调用恰好一条回执，tool 消息只写一次 =====
       if (result.toolCalls.length > 0) {
         const toolBlocks: Array<Record<string, unknown>> = [];
-        let paused = false;
+        let pausePlan: PausePlan | null = null;
         for (const call of result.toolCalls) {
           if (call.toolName === "request_input") {
-            const outcome = await handleRequestInput(deps, ctx, call.toolCallId, call.input as unknown, messages, usage, startedAt);
-            if (outcome.paused) {
-              paused = true;
+            const prepared = prepareRequestInput(deps, ctx, call.toolCallId, call.input as unknown);
+            toolBlocks.push(prepared.block);
+            if (prepared.pause) pausePlan = prepared.pause;
+            if (pausePlan) {
+              // 暂停后同组剩余调用给出明确的跳过回执
+              toolBlocks.push(...skippedBlocks(result.toolCalls, call.toolCallId));
+              break;
             }
-            toolBlocks.push(outcome.block);
-            if (paused) break; // 暂停后其余调用直接跳过（结果会说明）
           } else {
             const executed = await executeTool(call.toolName, call.input as Record<string, unknown>, ctx);
             toolBlocks.push({
@@ -169,12 +177,17 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
           }
         }
         messages.push({ role: "tool", content: toolBlocks });
-        saveCheckpoint(deps, taskId, batch, messages, ctx.papers, usage);
+
+        if (pausePlan) {
+          // 待补落库（单事务）：保存请求、检查点（含配对回执）与待补状态
+          commitRequestInput(deps, ctx, pausePlan, messages, usage);
+          return; // 释放执行槽
+        }
+        saveCheckpoint(deps, taskId, batch, messages, effectivePapers(ctx), usage);
         db.appendEvent(taskId, "progress", {
           step: usage.steps,
-          checked: coverageStats(ctx.papers).checked,
+          checked: coverageStats(effectivePapers(ctx)).checked,
         });
-        if (paused) return; // waiting_for_input 已在 handler 内落库，释放执行槽
         continue;
       }
 
@@ -205,7 +218,7 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
       });
       db.appendEvent(taskId, "task_cancelled", {});
     } else {
-      const stats = coverageStats(ctx.papers);
+      const stats = coverageStats(effectivePapers(ctx));
       if (stats.checked >= 1) {
         await finalize(deps, ctx, taskId, usage, startedAt, [`执行异常：${(error as Error).message}。以下为基于已核项的部分意见。`], true);
       } else {
@@ -223,26 +236,33 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
 }
 
 // ===== request_input（设计 §4.2 提问上限 / 怎样恢复）=====
+// 拆成两步：prepare 做纯决策（参数/幂等/上限），commit 在外层写完唯一的 tool 消息后
+// 于单事务内落库——回执只写一次，检查点里带的就是配对后的消息。
 
-interface RequestInputOutcome {
-  paused: boolean;
-  block: Record<string, unknown>;
+interface PausePlan {
+  requestId: string;
+  toolCallId: string;
+  seq: number;
+  data: z.infer<typeof requestInputSchema>;
+  reuseExisting: boolean;
 }
 
-async function handleRequestInput(
+interface RequestInputPrepared {
+  block: Record<string, unknown>;
+  pause: PausePlan | null;
+}
+
+function prepareRequestInput(
   deps: RunnerDeps,
   ctx: ToolContext,
   toolCallId: string,
   input: unknown,
-  messages: StoredMessage[],
-  usage: TaskUsage,
-  startedAt: number,
-): Promise<RequestInputOutcome> {
+): RequestInputPrepared {
   const { db } = deps;
   const parsed = requestInputSchema.safeParse(input);
   if (!parsed.success) {
     return {
-      paused: false,
+      pause: null,
       block: {
         type: "tool-result",
         toolCallId,
@@ -257,7 +277,9 @@ async function handleRequestInput(
   const existing = db.getRequestByToolCall(ctx.task.task_id, toolCallId);
   if (existing) {
     return {
-      paused: existing.status === "open",
+      pause: existing.status === "open"
+        ? { requestId: existing.request_id, toolCallId, seq: existing.seq, data: parsed.data, reuseExisting: true }
+        : null,
       block: {
         type: "tool-result",
         toolCallId,
@@ -273,7 +295,7 @@ async function handleRequestInput(
 
   if (ctx.task.input_closed) {
     return {
-      paused: false,
+      pause: null,
       block: {
         type: "tool-result",
         toolCallId,
@@ -292,7 +314,7 @@ async function handleRequestInput(
     db.updateTask(ctx.task.task_id, { input_closed: 1 });
     ctx.task.input_closed = 1;
     return {
-      paused: false,
+      pause: null,
       block: {
         type: "tool-result",
         toolCallId,
@@ -305,50 +327,66 @@ async function handleRequestInput(
     };
   }
 
-  const requestId = `req_${toolCallId.slice(-8) || Math.random().toString(16).slice(2, 10)}`;
-  db.transaction(() => {
-    db.createRequest({
-      request_id: requestId,
-      task_id: ctx.task.task_id,
-      tool_call_id: toolCallId,
-      seq: count + 1,
-      question: parsed.data.question,
-      impact: parsed.data.impact,
-      accepted_inputs: parsed.data.accepted_inputs,
-      status: "open",
-      answer: null,
-      answer_identity: null,
-      created_at: Date.now(),
-      answered_at: null,
-    });
-    messages.push({
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId,
-          toolName: "request_input",
-          output: {
-            request_id: requestId,
-            message: "已向用户提出补充请求，任务暂停等待用户补充。",
-          },
-        },
-      ],
-    });
-    saveCheckpoint(deps, ctx.task.task_id, ctx.task.current_batch!, messages, ctx.papers, usage);
-    db.updateTask(ctx.task.task_id, { status: "waiting_for_input" });
-    db.appendEvent(ctx.task.task_id, "input_requested", { request_id: requestId });
-  });
-
   return {
-    paused: true,
+    pause: { requestId: newRequestId(), toolCallId, seq: count + 1, data: parsed.data, reuseExisting: false },
     block: {
       type: "tool-result",
       toolCallId,
       toolName: "request_input",
-      output: { request_id: requestId, message: "已向用户提出补充请求，任务暂停。" },
+      output: { message: "已向用户提出补充请求，任务即将暂停等待补充。" },
     },
   };
+}
+
+function commitRequestInput(
+  deps: RunnerDeps,
+  ctx: ToolContext,
+  plan: PausePlan,
+  messages: StoredMessage[],
+  usage: TaskUsage,
+): void {
+  const { db } = deps;
+  db.transaction(() => {
+    if (!plan.reuseExisting) {
+      db.createRequest({
+        request_id: plan.requestId,
+        task_id: ctx.task.task_id,
+        tool_call_id: plan.toolCallId,
+        seq: plan.seq,
+        question: plan.data.question,
+        impact: plan.data.impact,
+        accepted_inputs: plan.data.accepted_inputs,
+        status: "open",
+        answer: null,
+        answer_identity: null,
+        created_at: Date.now(),
+        answered_at: null,
+        ...(plan.data.replace_target ? { replace_target: plan.data.replace_target } : {}),
+      });
+    }
+    saveCheckpoint(deps, ctx.task.task_id, ctx.task.current_batch!, messages, effectivePapers(ctx), usage);
+    db.updateTask(ctx.task.task_id, { status: "waiting_for_input" });
+    db.appendEvent(ctx.task.task_id, "input_requested", { request_id: plan.requestId });
+  });
+}
+
+/** 暂停后同组未执行调用的跳过回执（每个调用恰好一条结果，保持配对完整）。 */
+function skippedBlocks(calls: ReadonlyArray<{ toolCallId: string; toolName: string }>, afterCallId: string): Array<Record<string, unknown>> {
+  const index = calls.findIndex((c) => c.toolCallId === afterCallId);
+  return calls
+    .slice(index + 1)
+    .map((call) => ({
+      type: "tool-result",
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      isError: true,
+      output: { message: "任务因待补暂停，本调用未执行；恢复后请按需重新发起。" },
+    }));
+}
+
+/** 统计/落库用底稿：以运行时保存的活动范围为准（缺失项按待核兜底）。 */
+function effectivePapers(ctx: ToolContext): PapersDoc {
+  return enforceActiveScope(ctx.papers, ctx.activeScope);
 }
 
 // ===== 成文与发布（设计 §5 / §4.4 发布竞态）=====
@@ -364,14 +402,15 @@ async function finalize(
 ): Promise<void> {
   const { db } = deps;
   await refreshStatusCache(ctx);
+  const papers = effectivePapers(ctx);
   const materialIssues = buildMaterialIssues(ctx);
-  const stats = coverageStats(ctx.papers);
+  const stats = coverageStats(papers);
   const allUnreadable = ctx.materials.length > 0 && ctx.materials.every((m) => {
     const cached = ctx.docStatusCache.get(`${m.doc_id}@${m.version}`);
     return !cached?.ready;
   });
 
-  const outcome = determineOutcome(ctx.papers, {
+  const outcome = determineOutcome(papers, {
     revisionMaterials: ctx.materials,
     materialIssues,
     allMaterialsUnreadable: allUnreadable,
@@ -385,7 +424,7 @@ async function finalize(
   }
 
   const composed = composeConclusion({
-    papers: ctx.papers,
+    papers,
     outcome,
     ctx: {
       revisionMaterials: ctx.materials,
@@ -457,6 +496,7 @@ async function refreshStatusCache(ctx: ToolContext): Promise<void> {
 
 function buildMaterialIssues(ctx: ToolContext): MaterialIssue[] {
   const issues: MaterialIssue[] = [];
+  const timedOut = ctx.db.timedOutDocs(ctx.task.task_id, ctx.task.input_revision);
   for (const material of ctx.materials) {
     const cached = ctx.docStatusCache.get(`${material.doc_id}@${material.version}`);
     if (!cached) continue;
@@ -465,6 +505,8 @@ function buildMaterialIssues(ctx: ToolContext): MaterialIssue[] {
     else if (cached.status === "failed") {
       const error = cached.error as { reason?: string } | null;
       issue = `处理失败：${error?.reason ?? "未知原因"}`;
+    } else if (!cached.ready && timedOut.has(`${material.doc_id}@${material.version}`)) {
+      issue = `等待索引超时（>${Math.round(config.waitingIndexTimeoutSeconds / 60)} 分钟），本次按单份材料不可用处理`;
     } else if (!cached.ready && ["parsing", "structuring", "indexing", "uploaded"].includes(cached.status)) {
       issue = `材料仍在处理中（${cached.status}），本次未能纳入核查`;
     } else if (cached.status === "unknown") {
@@ -642,43 +684,60 @@ export function isFollowUpOnly(text: string): boolean {
   return questionChars / compact.length > 0.4;
 }
 
+/** StoredMessage → AI SDK ModelMessage（v5+ 形态）：
+ * - assistant 的工具调用是 content 数组里的 `tool-call` 块（不再使用旧 toolCalls 字段）；
+ * - tool 的 output 必须包装为 SDK 支持的 ToolResultContent：对象 → {type:'json'}，
+ *   字符串 → {type:'text'}，错误 → {type:'error-text'}。
+ */
 function toModelMessages(messages: readonly StoredMessage[]): ModelMessage[] {
   return messages.map((message) => {
     if (message.role === "assistant") {
-      return {
-        role: "assistant" as const,
-        content: typeof message.content === "string" ? message.content : "",
-        ...(message.toolCalls && message.toolCalls.length > 0
-          ? {
-              toolCalls: message.toolCalls.map((call) => ({
-                toolCallId: call.id,
-                toolName: call.name,
-                input: call.input,
-              })),
-            }
-          : {}),
-      } satisfies ModelMessage;
+      const content: Array<Record<string, unknown>> = [];
+      const text = typeof message.content === "string" ? message.content : "";
+      if (text.length > 0) content.push({ type: "text", text });
+      for (const call of message.toolCalls ?? []) {
+        content.push({
+          type: "tool-call",
+          toolCallId: call.id,
+          toolName: call.name,
+          input: (call.input ?? {}) as Record<string, unknown>,
+        });
+      }
+      if (content.length === 0) content.push({ type: "text", text: "" });
+      return { role: "assistant", content } as ModelMessage;
     }
     if (message.role === "tool") {
+      const blocks = Array.isArray(message.content) ? message.content : [];
       return {
-        role: "tool" as const,
-        content: (Array.isArray(message.content) ? message.content : []).map((block) => {
-          const b = block as Record<string, unknown>;
+        role: "tool",
+        content: blocks.map((raw) => {
+          const block = raw as Record<string, unknown>;
           return {
-            type: "tool-result" as const,
-            toolCallId: String(b.toolCallId),
-            toolName: String(b.toolName),
-            output: (b.output ?? "") as never,
-            ...(b.isError ? { isError: true } : {}),
+            type: "tool-result",
+            toolCallId: String(block.toolCallId),
+            toolName: String(block.toolName),
+            output: toToolResultContent(block.output, block.isError === true),
+            ...(block.isError === true ? { isError: true } : {}),
           };
         }),
-      } satisfies ModelMessage;
+      } as ModelMessage;
     }
     return {
       role: message.role,
       content: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
-    } satisfies ModelMessage;
+    } as ModelMessage;
   });
+}
+
+function toToolResultContent(
+  output: unknown,
+  isError: boolean,
+): { type: "json"; value: unknown } | { type: "text"; value: string } | { type: "error-text"; value: string } {
+  if (isError && typeof output === "string") return { type: "error-text", value: output };
+  if (typeof output === "string") return { type: "text", value: output };
+  if (output === null || output === undefined) return { type: "json", value: null };
+  if (typeof output === "object") return { type: "json", value: output };
+  return { type: "json", value: { value: output } };
 }
 
 export { validatePapers, estimateTokens };

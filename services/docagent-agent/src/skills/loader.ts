@@ -47,17 +47,31 @@ export function parseFrontmatter(raw: string): { data: Record<string, string>; b
   return { data, body };
 }
 
-function digest(content: string): string {
-  return createHash("sha256").update(content, "utf8").digest("hex").slice(0, 12);
-}
 
-/** 安装 skill 包：源可以是目录或 ZIP；安装到 skillsDir/<name>/<version>/。 */
+/** 安装 skill 包：源可以是目录或 ZIP；安装到 skillsDir/<name>/<version>/。
+ *
+ * - 每次安装使用独立随机暂存目录，异常包只影响本次暂存；
+ * - 版本号缺省时取**全包内容摘要**（入口文件、规则卡、模板、资产都参与），
+ *   任意资源变化都会产生新版本；同内容重复安装幂等返回原引用；
+ * - 显式版本号已发布时不可覆盖（内容不同需升版本号另行发布）。
+ */
 export function installSkill(source: string, skillsRoot: string = config.skillsDir): SkillPackage {
   const stat = fs.statSync(source);
-  const installRoot = path.join(skillsRoot, "_install_tmp");
-  fs.rmSync(installRoot, { recursive: true, force: true });
-  fs.mkdirSync(installRoot, { recursive: true });
+  fs.mkdirSync(skillsRoot, { recursive: true });
+  const installRoot = fs.mkdtempSync(path.join(skillsRoot, "_install-"));
+  try {
+    return installFromStaging(stat, source, installRoot, skillsRoot);
+  } finally {
+    fs.rmSync(installRoot, { recursive: true, force: true });
+  }
+}
 
+function installFromStaging(
+  stat: { isDirectory(): boolean },
+  source: string,
+  installRoot: string,
+  skillsRoot: string,
+): SkillPackage {
   let staging: string;
   if (stat.isDirectory()) {
     staging = copyTree(source, installRoot);
@@ -69,26 +83,63 @@ export function installSkill(source: string, skillsRoot: string = config.skillsD
 
   const skillMd = findSkillMd(staging);
   if (!skillMd) throw new Error("skill 包缺少 SKILL.md");
+  const packageDir = path.dirname(skillMd);
   const raw = fs.readFileSync(skillMd, "utf8");
-  const { data, body } = parseFrontmatter(raw);
-  const name = data.name || path.basename(path.dirname(skillMd));
+  const { data } = parseFrontmatter(raw);
+  const name = data.name || path.basename(packageDir);
   if (!/^[\w.-]+$/.test(name)) throw new Error(`skill 名称不合法：${name}`);
-  const version = data.version && data.version.trim() ? data.version.trim() : digest(raw);
+  const explicitVersion = data.version && data.version.trim() ? data.version.trim() : null;
+  const version = explicitVersion ?? packageDigest(packageDir);
   const description = (data.description || "").slice(0, 2000);
 
   const finalRoot = path.join(skillsRoot, name, version);
-  fs.rmSync(finalRoot, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(finalRoot), { recursive: true });
-  fs.renameSync(path.dirname(skillMd), finalRoot);
-  fs.rmSync(installRoot, { recursive: true, force: true });
+  if (fs.existsSync(finalRoot)) {
+    if (explicitVersion) {
+      throw new Error(
+        `skill 版本已发布，不可覆盖：${name}@${version}。内容变化请升版本号后另行发布。`,
+      );
+    }
+    // 摘要版本：同内容重复安装，幂等返回已安装的包
+    return {
+      ref: `${name}@${version}`,
+      manifest: { name, description, version },
+      rootPath: finalRoot,
+      skillMdPath: path.join(finalRoot, "SKILL.md"),
+    };
+  }
 
-  const manifest: SkillManifest = { name, description, version };
+  fs.mkdirSync(path.dirname(finalRoot), { recursive: true });
+  fs.renameSync(packageDir, finalRoot);
+
   return {
     ref: `${name}@${version}`,
-    manifest,
+    manifest: { name, description, version },
     rootPath: finalRoot,
     skillMdPath: path.join(finalRoot, "SKILL.md"),
   };
+}
+
+/** 全包内容摘要：按相对路径排序，对每个文件内容做链式 hash（入口、规则卡、模板、资产全覆盖）。 */
+function packageDigest(packageDir: string): string {
+  const files: string[] = [];
+  const walk = (dir: string, prefix: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }) as fs.Dirent[]) {
+      if (entry.name.startsWith(".") || entry.name === "__MACOSX") continue;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+      else files.push(rel);
+    }
+  };
+  walk(packageDir, "");
+  files.sort();
+  const hash = createHash("sha256");
+  for (const rel of files) {
+    hash.update(rel);
+    hash.update("\0");
+    hash.update(fs.readFileSync(path.join(packageDir, rel)));
+    hash.update("\0");
+  }
+  return hash.digest("hex").slice(0, 12);
 }
 
 function copyTree(src: string, destRoot: string): string {

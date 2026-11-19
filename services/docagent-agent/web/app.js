@@ -6,9 +6,62 @@ const PIPELINE_BASE = localStorage.getItem("pipelineBase") || "http://localhost:
 const state = {
   taskId: null,
   pollTimer: null,
-  pendingUploads: [], // 待补卡上传的文件 → {doc_id, version, role}
+  pendingUploads: [], // 待补卡上传的新增文件 → {doc_id, version, role, label}
   currentPending: null,
 };
+
+/** 白名单净化（A3）：marked 输出的 HTML 只保留安全的标签与属性；
+ * 净化器或 marked 不可用时降级为 textContent 展示原始 Markdown。 */
+const ALLOWED_TAGS = new Set([
+  "h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr", "blockquote",
+  "ul", "ol", "li", "strong", "em", "del", "code", "pre",
+  "a", "table", "thead", "tbody", "tr", "th", "td", "span", "div",
+]);
+const ALLOWED_ATTRS = new Set(["href", "title"]);
+
+const DANGEROUS_TAGS = ["SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "LINK", "META", "FORM", "INPUT", "BUTTON"];
+
+function sanitizeHtmlNode(node) {
+  for (const child of [...node.children]) {
+    const tag = String(child.tagName ?? "").toUpperCase();
+    if (DANGEROUS_TAGS.includes(tag)) {
+      child.remove(); // 可执行/可交互元素整删
+      continue;
+    }
+    if (!ALLOWED_TAGS.has(child.tagName.toLowerCase())) {
+      const parent = child.parentNode;
+      child.replaceWith(...child.childNodes); // 未知标签去壳，内容保留继续净化
+      if (parent) sanitizeHtmlNode(parent);
+      continue;
+    }
+    for (const attr of [...child.attributes]) {
+      const name = attr.name.toLowerCase();
+      const value = String(attr.value ?? "").trim().toLowerCase();
+      if (
+        !ALLOWED_ATTRS.has(name) ||
+        (name === "href" && (value.startsWith("javascript:") || value.startsWith("data:") || value.startsWith("vbscript:")))
+      ) {
+        child.removeAttribute(attr.name);
+      }
+    }
+    sanitizeHtmlNode(child);
+  }
+}
+
+function renderMarkdown(container, markdownText) {
+  if (typeof marked?.parse !== "function") {
+    const pre = document.createElement("pre");
+    pre.className = "markdown-fallback";
+    pre.textContent = markdownText;
+    container.replaceChildren(pre);
+    return;
+  }
+  const raw = marked.parse(markdownText, { breaks: true });
+  const template = document.createElement("template");
+  template.innerHTML = raw;
+  sanitizeHtmlNode(template.content);
+  container.replaceChildren(template.content);
+}
 
 const identity = () => ({
   "x-tenant-id": $("tenant").value.trim() || "demo-tenant",
@@ -216,6 +269,17 @@ function renderPendingCard(pending, detail) {
     const acceptsFile = pending.accepted_inputs.includes("file");
     $("pending-file").disabled = !acceptsFile;
     if (!acceptsFile) $("pending-file").title = "该问题仅接受文字回答";
+    // B3：替换目标回显——上传的文件将替换该旧版本并沿用原用途
+    const replaceHint = $("replace-hint");
+    if (pending.replace_target) {
+      const target = pending.replace_target;
+      replaceHint.textContent = `本次上传将替换：${target.label}（v${target.version}，用途：${target.role || "未标注"}）。新文件就绪后原检查项将按新材料复核。`;
+      replaceHint.hidden = false;
+      $("pending-file").removeAttribute("multiple");
+    } else {
+      replaceHint.hidden = true;
+      $("pending-file").setAttribute("multiple", "");
+    }
   }
   card.hidden = false;
 }
@@ -224,18 +288,43 @@ $("pending-file").onchange = async (event) => {
   const files = [...event.target.files];
   if (!files.length) return;
   const status = $("pending-status");
+  const replaceTarget = state.currentPending?.replace_target;
   try {
     state.pendingUploads = [];
     for (const file of files) {
       status.textContent = `上传 ${file.name}…`;
-      const receipt = await uploadFile(file, "补充材料", { textContent: "" });
-      state.pendingUploads.push({ doc_id: receipt.doc_id, version: receipt.version, role: "补充材料", label: file.name });
+      if (replaceTarget) {
+        // B3：替换目标 → 上传为该文档的新版本
+        const resp = await fetch(`${PIPELINE_BASE}/api/v1/docs/${replaceTarget.doc_id}/versions`, {
+          method: "POST",
+          body: await fileToForm(file),
+          headers: identity(),
+        });
+        const body = await resp.json();
+        if (!resp.ok) throw new Error(body.detail || `上传失败 ${resp.status}`);
+        state.pendingUploads.push({
+          doc_id: body.doc_id,
+          version: body.version,
+          role: replaceTarget.role || "替换材料",
+          label: file.name,
+          replacing: replaceTarget,
+        });
+      } else {
+        const receipt = await uploadFile(file, "补充材料", { textContent: "" });
+        state.pendingUploads.push({ doc_id: receipt.doc_id, version: receipt.version, role: "补充材料", label: file.name });
+      }
     }
     status.textContent = `已上传 ${state.pendingUploads.length} 个文件（提交补充时一并生效）`;
   } catch (error) {
     status.textContent = `上传失败：${error.message}`;
   }
 };
+
+async function fileToForm(file) {
+  const form = new FormData();
+  form.append("file", file);
+  return form;
+}
 
 async function submitPending(action) {
   const pending = state.currentPending;
@@ -249,8 +338,16 @@ async function submitPending(action) {
     if (action === "supplement") {
       const text = $("pending-text").value.trim();
       if (text) body.text = text;
-      if (state.pendingUploads.length > 0) body.add_docs = state.pendingUploads;
-      if (!text && state.pendingUploads.length === 0) {
+      // B3：带替换标记的上传走 replace_docs（旧回执 + 新回执 + 原用途），其余为新增
+      const replaceDocs = state.pendingUploads
+        .filter((u) => u.replacing)
+        .map((u) => ({ old: { doc_id: u.replacing.doc_id, version: u.replacing.version }, new: { doc_id: u.doc_id, version: u.version }, role: u.role, label: u.label }));
+      const addDocs = state.pendingUploads
+        .filter((u) => !u.replacing)
+        .map(({ doc_id, version, role, label }) => ({ doc_id, version, role, label }));
+      if (addDocs.length > 0) body.add_docs = addDocs;
+      if (replaceDocs.length > 0) body.replace_docs = replaceDocs;
+      if (!text && addDocs.length === 0 && replaceDocs.length === 0) {
         throw new Error("请填写文字或上传文件");
       }
     }
@@ -292,7 +389,7 @@ async function renderResult(status) {
             ? "部分审核"
             : "材料不足";
       outcomeBadge.className = `badge ${result.review_outcome}`;
-      $("result-md").innerHTML = marked.parse(result.conclusion_md, { breaks: true });
+      renderMarkdown($("result-md"), result.conclusion_md);
       const used = (result.used_materials || []).map((m) => `${m.label}（v${m.version}）`).join("、");
       $("result-materials").textContent = used ? `本次实际使用材料：${used}` : "本次未使用文件材料。";
       const issues = result.material_issues || [];

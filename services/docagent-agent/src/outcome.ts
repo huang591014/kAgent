@@ -65,6 +65,24 @@ export function composeConclusion(input: ComposeInput): ComposedResult {
   const findings = papers.items.filter((i) => i.status === "checked" && i.finding !== null);
   const pending = papers.items.filter((i) => i.status === "pending");
   const naItems = papers.items.filter((i) => i.status === "not_applicable");
+  const allNotApplicable =
+    stats.scopeDetermined && stats.applicable === 0 && naItems.length > 0 && findings.length === 0;
+
+  // B2：全部不适用是独立交付口径，conclusion_hint 不能覆盖运行时判定
+  if (allNotApplicable) {
+    sections.push("【结论】\n本次规则均不适用。已确认的规则卡各项均给出不适用理由，详见核查范围摘要。");
+    sections.push(
+      `【核查范围摘要】\n${scopeSummary(stats, naItems, usedMaterials)}\n- 逐项不适用理由：\n${naItems
+        .map((i) => `  · ${i.item_id}（${i.rule_card}）：${i.not_applicable_reason}`)
+        .join("\n")}`,
+    );
+    return {
+      conclusion_md: sections.join("\n\n"),
+      review_outcome: outcome,
+      used_materials: usedMaterials,
+      stats,
+    };
+  }
 
   sections.push(`【结论】\n${conclusionLine(papers, outcome, stats)}`);
 

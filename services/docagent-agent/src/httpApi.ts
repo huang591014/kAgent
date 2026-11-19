@@ -24,6 +24,11 @@ interface Identity {
   admin: boolean;
 }
 
+/** agent 服务自身的 node_modules 目录（静态页依赖的浏览器构建从这里分发）。 */
+function agentNodeModulesDir(): string {
+  return path.resolve(config.webDir, "..", "node_modules");
+}
+
 const identityHeaders = (request: { headers: Record<string, unknown> }): Identity => {
   const tenant = String(request.headers["x-tenant-id"] ?? "");
   const user = String(request.headers["x-user-id"] ?? "");
@@ -65,6 +70,10 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   }));
 
   app.post("/api/skills/install", async (request, reply) => {
+    // D2：在线安装仅平台管理员可用（M1 用 x-admin 头；生产接真实身份体系）
+    if (request.headers["x-admin"] !== "1") {
+      throw new AcceptConflictError(403, "仅管理员可安装 skill 包", null);
+    }
     const body = request.body as { source?: string } | null;
     if (!body?.source) throw new AcceptConflictError(400, "缺少 source（目录或 ZIP 路径）", null);
     const pkg = deps.skills.install(body.source);
@@ -144,14 +153,28 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
     }
 
     const open = deps.db.openRequest(id);
-    const pendingInput = open
-      ? {
-          request_id: open.request_id,
-          question: open.question,
-          impact: open.impact,
-          accepted_inputs: JSON.parse(open.accepted_inputs) as string[],
-        }
-      : null;
+    let pendingInput: Record<string, unknown> | null = null;
+    if (open) {
+      pendingInput = {
+        request_id: open.request_id,
+        question: open.question,
+        impact: open.impact,
+        accepted_inputs: JSON.parse(open.accepted_inputs) as string[],
+      };
+      // B3：替换目标回显（含旧材料名与用途，前端据此展示替换流程）
+      const replaceTarget = (open as unknown as { replace_target?: string | null }).replace_target;
+      if (replaceTarget) {
+        const target = JSON.parse(replaceTarget) as { doc_id: string; version: number };
+        const material = materials.find((m) => m.doc_id === target.doc_id && m.version === target.version)
+          ?? materials.find((m) => m.doc_id === target.doc_id);
+        pendingInput.replace_target = {
+          doc_id: target.doc_id,
+          version: target.version,
+          label: material?.label ?? target.doc_id,
+          role: material?.role ?? "",
+        };
+      }
+    }
 
     return {
       task_id: id,
@@ -295,9 +318,19 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   const webDir = config.webDir;
   if (fs.existsSync(webDir)) {
     await app.register(fastifyStatic, { root: webDir });
-    // marked 由 node_modules 提供，前端离线可用
-    const markedPath = path.join(webDir, "..", "node_modules", "marked", "marked.min.js");
-    if (fs.existsSync(markedPath)) {
+    // marked 浏览器构建：新版包在 lib/marked.umd.js，旧版在 marked.min.js；
+    // 从 node_modules 实际存在的候选提供，与自定义 Web 目录互相独立。
+    const markedCandidates = [
+      path.join(agentNodeModulesDir(), "marked", "lib", "marked.umd.js"),
+      path.join(agentNodeModulesDir(), "marked", "marked.min.js"),
+      path.join(agentNodeModulesDir(), "marked", "lib", "marked.cjs"),
+    ];
+    const markedPath = markedCandidates.find((candidate) => fs.existsSync(candidate));
+    if (markedPath) {
+      app.get("/vendor/marked.js", async (_request, reply) => {
+        void reply.type("application/javascript").send(fs.readFileSync(markedPath));
+      });
+      // 兼容旧引用路径
       app.get("/vendor/marked.min.js", async (_request, reply) => {
         void reply.type("application/javascript").send(fs.readFileSync(markedPath));
       });

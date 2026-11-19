@@ -12,8 +12,9 @@ async function main(): Promise<void> {
   const db = new Db();
   const skills = new SkillRegistry(db);
   const installed = skills.scanRoot();
-  if (installed.length > 0) {
-    console.log(`[skills] 已安装 ${installed.length} 个 skill：${installed.map((p) => p.ref).join("、")}`);
+  const refs = [...new Set(installed.map((p) => p.ref))];
+  if (refs.length > 0) {
+    console.log(`[skills] 已安装 ${refs.length} 个 skill：${refs.join("、")}`);
   } else {
     console.warn(`[skills] ${config.skillsDir} 下没有 skill 包；请安装后重启，或调用 POST /api/skills/install`);
   }

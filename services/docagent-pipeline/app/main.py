@@ -140,7 +140,7 @@ async def create_doc(
         raise HTTPException(status_code=413, detail="文件超出 50MB 上限")
     if not data:
         raise HTTPException(status_code=400, detail="空文件")
-    return await _register_upload(request, identity, data, file.filename or "untitled", file.content_type or "")
+    return await _register_upload(request, identity, data, file.filename or "untitled", file.content_type or "", doc=None)
 
 
 @app.post("/api/v1/docs/{doc_id}/versions")
@@ -156,7 +156,7 @@ async def create_version(
         raise HTTPException(status_code=413, detail="文件超出 50MB 上限")
     if not data:
         raise HTTPException(status_code=400, detail="空文件")
-    return await _register_upload(request, identity, data, file.filename or doc.get("filename", "untitled"), file.content_type or "")
+    return await _register_upload(request, identity, data, file.filename or doc.get("filename", "untitled"), file.content_type or "", doc=doc)
 
 
 @app.get("/api/v1/docs/{doc_id}")
@@ -272,11 +272,11 @@ async def retry_job(
         for key, ver in doc.get("versions", {}).items():
             if ver.get("job_id") == job_id:
                 candidate = (doc["doc_id"], int(key))
-                if identity.is_internal or (
-                    doc.get("tenant_id") == identity.tenant_id
-                    and (doc.get("uploaded_by") == identity.user_id or identity.is_admin)
-                ):
+                try:
+                    ensure_doc_access(identity, doc)
                     found = candidate
+                except HTTPException:
+                    found = None
                 break
         if found:
             break

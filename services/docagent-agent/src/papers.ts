@@ -11,8 +11,15 @@ export interface RevisionMaterialRef {
   version: number;
 }
 
+/** 运行时独立保存的活动范围（B1：底稿内的 scope 只作自洽描述，分母以保存范围为准）。 */
+export interface ActiveScope {
+  rule_cards: string[];
+  expected_item_ids: string[];
+  reason: string;
+}
+
 export type PapersValidation =
-  | { ok: true; papers: PapersDoc }
+  | { ok: true; papers: PapersDoc; scopeChanged: boolean }
   | { ok: false; errors: string[] };
 
 const ITEM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -23,7 +30,11 @@ const CONCLUSION_HINTS = [
   "建议退回补正",
 ];
 
-export function validatePapers(input: unknown, revisionMaterials: readonly RevisionMaterialRef[]): PapersValidation {
+export function validatePapers(
+  input: unknown,
+  revisionMaterials: readonly RevisionMaterialRef[],
+  activeScope: ActiveScope | null = null,
+): PapersValidation {
   const errors: string[] = [];
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return { ok: false, errors: ["底稿必须是 JSON 对象"] };
@@ -51,6 +62,29 @@ export function validatePapers(input: unknown, revisionMaterials: readonly Revis
         seen.add(id);
       }
       scope = { rule_cards: (ruleCards as string[]) ?? [], expected_item_ids: expected as string[] };
+    }
+  }
+
+  // 与运行时保存的活动范围核对：同一路由下不允许改动分母；路由变化需要理由。
+  let scopeChanged = false;
+  const scopeChangeReason = optionalString(raw.scope_change_reason);
+  if (activeScope) {
+    if (!scope) {
+      errors.push("已确定审核路径后不能清空 scope；如需调整请说明 scope_change_reason 并登记新范围");
+    } else {
+      const sameRoute =
+        arraysEqual(scope.rule_cards, activeScope.rule_cards) &&
+        arraysEqual(scope.expected_item_ids, activeScope.expected_item_ids);
+      if (!sameRoute) {
+        if (!scopeChangeReason) {
+          errors.push(
+            `预期检查项范围与已登记的不一致（已登记：${activeScope.expected_item_ids.join("、")}，原因：${activeScope.reason}）。` +
+              "确属路由变化时必须填写 scope_change_reason 说明依据，并登记新规则卡的完整预期项。",
+          );
+        } else {
+          scopeChanged = true;
+        }
+      }
     }
   }
 
@@ -157,13 +191,18 @@ export function validatePapers(input: unknown, revisionMaterials: readonly Revis
     });
   }
 
-  // 预期项完整性：scope 登记后，每个 expected id 必须有对应 item，不允许意外项
+  // 预期项完整性：以生效范围（同路由=已保存范围；路由变化=新登记范围）为分母，
+  // 每个 expected id 必须有对应 item；缺失/删除待核项的写入被拒绝，防止缩减分母。
   if (scope) {
     for (const id of scope.expected_item_ids) {
       if (!seenIds.has(id)) errors.push(`预期检查项缺失：${id}`);
     }
     for (const id of seenIds) {
       if (!scope.expected_item_ids.includes(id)) errors.push(`存在预期清单之外的检查项：${id}`);
+    }
+  } else if (activeScope) {
+    for (const id of activeScope.expected_item_ids) {
+      if (!seenIds.has(id)) errors.push(`预期检查项缺失：${id}`);
     }
   }
 
@@ -181,6 +220,35 @@ export function validatePapers(input: unknown, revisionMaterials: readonly Revis
   return {
     ok: true,
     papers: { scope, items: parsedItems, conclusion_hint: conclusionHint },
+    scopeChanged,
+  };
+}
+
+function arraysEqual<T>(a: readonly T[], b: readonly T[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/** 以运行时保存的活动范围重建统计用底稿：scope 用保存值，缺失项补 pending 占位（双保险）。 */
+export function enforceActiveScope(papers: PapersDoc, activeScope: ActiveScope | null): PapersDoc {
+  if (!activeScope) return papers;
+  const present = new Map(papers.items.map((i) => [i.item_id, i]));
+  const items: PaperItem[] = activeScope.expected_item_ids.map(
+    (id) =>
+      present.get(id) ?? {
+        item_id: id,
+        rule_card: activeScope.rule_cards.join("、") || "未记录",
+        status: "pending",
+        finding: null,
+        used_materials: [],
+        pending_reason: "该预期检查项在底稿中缺失，按待核处理",
+        missing_role: null,
+        not_applicable_reason: null,
+      },
+  );
+  return {
+    ...papers,
+    scope: { rule_cards: activeScope.rule_cards, expected_item_ids: activeScope.expected_item_ids },
+    items,
   };
 }
 

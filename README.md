@@ -123,19 +123,26 @@ pipeline（:8000）：`POST /api/v1/docs`、`POST /api/v1/docs/{id}/versions`、
 ## 测试
 
 ```bash
-cd services/docagent-agent && npm test       # vitest：底稿校验、覆盖判定与成文、
-                                             # skill 加载、补件接纳协议、上下文预算、纯追问识别
+cd services/docagent-agent && npm test       # vitest：模型替身 e2e（工具循环/待补恢复/原子领取）、
+                                             # 底稿校验与活动范围、覆盖判定与成文、skill 加载、
+                                             # 补件接纳协议、上下文预算、纯追问识别
 cd services/docagent-pipeline && .venv/Scripts/python -m pytest tests/ -q
+                                             # pytest：条款切块、DOCX 解析、上传路由（替身 S3/元数据/队列）
 ```
 
 ## M1 边界与实现说明
 
 - 输入为数字版 PDF / DOCX；扫描件标记 `needs_ocr` 暂不可读。XLSX/PPTX、OCR、Word 生成、子 Agent、语义检索（Milvus）均不在本期。
-- 结论正文始终由**运行时按 working-papers 组装**（模型成文与兜底成文同一路径）：空底稿或损坏写入不能产生“全部核查完毕”的统计；全部核查且无发现时必须附核查范围摘要。
+- 结论正文始终由**运行时按 working-papers 组装**（模型成文与兜底成文同一路径）：空底稿或损坏写入不能产生“全部核查完毕”的统计；全部核查且无发现时必须附核查范围摘要；全部不适用是独立交付口径（“本次规则均不适用”+逐项理由），模型的 `conclusion_hint` 不覆盖该口径。
+- **预期审查范围由运行时独立保存**（`task_scopes` 表，按任务 × 输入修订）：底稿内同步删改 expected 或删除待核项会被写入校验拒绝；路由确需变化必须携带 `scope_change_reason` 并重登记完整范围；统计与成文的分母始终取保存范围，底稿缺失项按待核兜底。
+- 模型消息以 AI SDK `ModelMessage` 为边界往返：assistant 的工具调用是 content 内 `tool-call` 块，tool 结果按原 ID 配对且包装为 `json / text / error-text`；待补暂停时同组未执行调用有明确跳过回执。
+- 执行领取以 `claimTask`（`status=queued` 条件更新）原子完成，定时 tick 与 kick 重叠时同一任务只有一个执行批次；批次贯穿检查点与结果发布，发布前校验批次、输入修订与状态。
+- 等待索引的起点与截止持久化（`index_waits`，任务 × 修订 × 版本），超时把该版本记为不可用并交还审核逻辑（带原因进入 `material_issues`），重启沿用截止时间。
 - 材料引用粒度为文件级（`doc_id + version`）；逐条定位与可点击引用留作后续增强。
 - 底稿在 `conclusion_hint` 基础上支持可选 `finding.location / basis`，对齐合规包输出模板四要素；成文章节名沿用 skill 模板（【结论】【审核意见】等）。
 - 任务存储为 SQLite（node:sqlite，WAL）。设计 §7 要求“任务存储能原子完成回答接纳与恢复调度登记”——已用单事务实现（`taskService.acceptInput`）；换企业级存储时替换 `src/db.ts` 实现即可。
-- 调度为进程内定时器；waiting_index 轮询 pipeline 状态，超时按单份材料不可用回到审核逻辑。
+- 权限：agent 服务凭内部密钥调 pipeline 时，材料属主校验仍按被代理的任务属主执行（服务密钥只证明调用方，不给管理范围）；`POST /api/skills/install` 仅 `x-admin: 1` 可用，已发布 skill 版本目录不可覆盖（摘要版本同内容幂等，显式版本冲突报错），版本摘要覆盖包内全部资源。
+- 前端 Markdown 渲染使用白名单净化（标签/属性过滤，危险元素整删），渲染依赖加载失败时降级 `textContent` 展示原始正文。
 - SSE 为轮询数据库的简化实现（每连接 2s 查询），适合 M1 规模。
 
 ## 路线（设计 §7）

@@ -28,11 +28,14 @@ def resolve_identity(
     x_internal_key: str | None = Header(default=None),
 ) -> Identity:
     if x_internal_key and x_internal_key == settings.internal_service_key:
-        # agent 服务内部调用：身份由 agent 传入（代任务属主查询），跳过用户口令层。
+        # agent 服务内部调用：服务密钥只证明调用方是 agent；
+        # 被代理身份（x-user-id，即任务属主）仍按普通用户口径做材料属主校验（D1）。
+        if not x_tenant_id or not x_user_id:
+            raise HTTPException(status_code=401, detail="internal call missing proxied tenant/user headers")
         return Identity(
-            tenant_id=x_tenant_id or "",
-            user_id=x_user_id or "internal",
-            is_admin=True,
+            tenant_id=x_tenant_id,
+            user_id=x_user_id,
+            is_admin=False,
             is_internal=True,
         )
     if not x_tenant_id or not x_user_id:
@@ -45,13 +48,12 @@ def resolve_identity(
 
 
 def ensure_doc_access(identity: Identity, doc: dict) -> None:
-    """普通用户只访问自己上传的材料；管理员按管理范围（M1：租户内全部）可见。"""
-    if identity.is_internal:
-        return
+    """普通用户（含 agent 代查的被代理身份）只访问自己上传的材料；
+    管理员按管理范围（M1：租户内全部）可见。internal 身份不再获得管理范围。"""
     if doc.get("tenant_id") != identity.tenant_id:
         raise HTTPException(status_code=404, detail="doc not found")
     if doc.get("uploaded_by") == identity.user_id:
         return
-    if identity.is_admin:
+    if not identity.is_internal and identity.is_admin:
         return
     raise HTTPException(status_code=403, detail="doc not accessible")

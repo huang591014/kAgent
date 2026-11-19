@@ -214,6 +214,8 @@ export const taskService = {
 
       const nextRevision = task.input_revision + 1;
       db.forkInputs(taskId, task.input_revision, nextRevision);
+      // 普通补件沿用有效审查范围（B1）；路由确需变化时由模型带 scope_change_reason 重登记
+      db.carryScopeToRevision(taskId, task.input_revision, nextRevision);
 
       // 修改下一修订的材料集合
       let seq = currentMaterials.length;

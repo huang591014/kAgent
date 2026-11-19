@@ -15,7 +15,7 @@ import type { Db, TaskRow } from "../db.js";
 import type { SkillRegistry } from "../skills/registry.js";
 import type { OpenSearchRetrieval } from "../opensearch.js";
 import { pipeline } from "../pipelineClient.js";
-import { validatePapers } from "../papers.js";
+import { validatePapers, type ActiveScope } from "../papers.js";
 import type { PapersDoc } from "../types.js";
 import { listPackageFiles, loadSkillBody } from "../skills/loader.js";
 
@@ -129,6 +129,8 @@ export interface ToolContext {
   docStatusCache: Map<string, { status: string; ready: boolean; needs_ocr: boolean; error: unknown; parse_gaps: Array<{ page: number; reason: string }> }>;
   /** 当前底稿（从工作区读取的权威副本） */
   papers: PapersDoc;
+  /** 运行时保存的活动范围（B1）；写底稿时核对，路由变化需 scope_change_reason */
+  activeScope: ActiveScope | null;
 }
 
 export interface ToolOutcome {
@@ -228,12 +230,28 @@ function runWriteFile(filePath: string, content: string, ctx: ToolContext): Tool
     } catch (error) {
       return err(`底稿不是合法 JSON：${(error as Error).message}。上一份有效快照已保留，请修正后重写。`);
     }
-    const validation = validatePapers(parsed, ctx.materials);
+    const validation = validatePapers(parsed, ctx.materials, ctx.activeScope);
     if (!validation.ok) {
       return err({
         message: "底稿校验失败，未写入；上一份有效快照已保留。",
         errors: validation.errors,
       });
+    }
+    // 首次确定路径或路由变化：把范围独立保存到运行时存储（分母不随底稿文件漂移）
+    if (validation.papers.scope && (!ctx.activeScope || validation.scopeChanged)) {
+      const reason = validation.scopeChanged
+        ? String((parsed as Record<string, unknown>).scope_change_reason ?? "route-change")
+        : "initial";
+      ctx.db.saveActiveScope(ctx.task.task_id, ctx.task.input_revision, {
+        rule_cards: validation.papers.scope.rule_cards,
+        expected_item_ids: validation.papers.scope.expected_item_ids,
+        reason,
+      });
+      ctx.activeScope = {
+        rule_cards: validation.papers.scope.rule_cards,
+        expected_item_ids: validation.papers.scope.expected_item_ids,
+        reason,
+      };
     }
     ctx.papers = validation.papers;
   }

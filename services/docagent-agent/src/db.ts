@@ -114,10 +114,33 @@ CREATE TABLE IF NOT EXISTS input_requests (
   status TEXT NOT NULL,
   answer TEXT,
   answer_identity TEXT,
+  replace_target TEXT,
   created_at INTEGER NOT NULL,
   answered_at INTEGER,
   UNIQUE (task_id, tool_call_id),
   UNIQUE (task_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS task_scopes (
+  task_id TEXT NOT NULL,
+  input_revision INTEGER NOT NULL,
+  rule_cards TEXT NOT NULL,
+  expected_item_ids TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT 'initial',
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, input_revision, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS index_waits (
+  task_id TEXT NOT NULL,
+  input_revision INTEGER NOT NULL,
+  doc_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  since INTEGER NOT NULL,
+  deadline INTEGER NOT NULL,
+  decided TEXT,
+  PRIMARY KEY (task_id, input_revision, doc_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -186,6 +209,26 @@ export class Db {
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** 轻量迁移：给旧库补新列。 */
+  private migrate(): void {
+    const columns = (
+      this.db.prepare("PRAGMA table_info(input_requests)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    if (!columns.includes("replace_target")) {
+      this.db.exec("ALTER TABLE input_requests ADD COLUMN replace_target TEXT");
+    }
+  }
+
+  /** 原子领取：仅当任务仍为 queued 时置 running 并分配批次；返回是否领取成功。 */
+  claimTask(taskId: string, batch: string): { claimed: boolean; task?: TaskRow } {
+    const info = this.db
+      .prepare("UPDATE tasks SET status = 'running', current_batch = ?, updated_at = ? WHERE task_id = ? AND status = 'queued'")
+      .run(batch, Date.now(), taskId);
+    if (Number(info.changes) === 0) return { claimed: false };
+    return { claimed: true, task: this.getTask(taskId) };
   }
 
   close(): void {
@@ -293,11 +336,11 @@ export class Db {
     return row.n;
   }
 
-  createRequest(req: InputRequest): void {
+  createRequest(req: InputRequest & { replace_target?: { doc_id: string; version: number } | null }): void {
     this.db
       .prepare(
-        `INSERT INTO input_requests (request_id, task_id, tool_call_id, seq, question, impact, accepted_inputs, status, answer, answer_identity, created_at, answered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL)`,
+        `INSERT INTO input_requests (request_id, task_id, tool_call_id, seq, question, impact, accepted_inputs, status, answer, answer_identity, replace_target, created_at, answered_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)`,
       )
       .run(
         req.request_id,
@@ -308,6 +351,7 @@ export class Db {
         req.impact,
         JSON.stringify(req.accepted_inputs),
         req.status,
+        req.replace_target ? JSON.stringify(req.replace_target) : null,
         req.created_at,
       );
   }
@@ -353,6 +397,61 @@ export class Db {
     return this.db
       .prepare("SELECT seq, ts, type, data FROM events WHERE task_id = ? AND seq > ? ORDER BY seq ASC")
       .all(taskId, afterSeq) as Array<{ seq: number; ts: number; type: string; data: string }>;
+  }
+
+  // ===== active scope（B1：运行时独立保存的预期范围，防止底稿内自行缩减分母）=====
+  getActiveScope(taskId: string, revision: number): { rule_cards: string[]; expected_item_ids: string[]; reason: string } | null {
+    const row = this.db
+      .prepare("SELECT * FROM task_scopes WHERE task_id = ? AND input_revision = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1")
+      .get(taskId, revision) as { rule_cards: string; expected_item_ids: string; reason: string } | undefined;
+    if (!row) return null;
+    return { rule_cards: JSON.parse(row.rule_cards), expected_item_ids: JSON.parse(row.expected_item_ids), reason: row.reason };
+  }
+
+  saveActiveScope(taskId: string, revision: number, scope: { rule_cards: string[]; expected_item_ids: string[]; reason: string }): void {
+    this.db
+      .prepare("UPDATE task_scopes SET is_active = 0 WHERE task_id = ? AND input_revision = ?")
+      .run(taskId, revision);
+    this.db
+      .prepare(
+        "INSERT INTO task_scopes (task_id, input_revision, rule_cards, expected_item_ids, reason, is_active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+      )
+      .run(taskId, revision, JSON.stringify(scope.rule_cards), JSON.stringify(scope.expected_item_ids), scope.reason, Date.now());
+  }
+
+  /** 补件接纳时把活动范围沿用到新修订（普通补件沿用有效范围）。 */
+  carryScopeToRevision(taskId: string, fromRevision: number, toRevision: number): void {
+    const scope = this.getActiveScope(taskId, fromRevision);
+    if (!scope) return;
+    this.saveActiveScope(taskId, toRevision, { ...scope, reason: `carried-from-r${fromRevision}` });
+  }
+
+  // ===== index waits（C2：持久化等待起点与截止，超时按单份材料不可用交还审核）=====
+  getOrCreateWait(taskId: string, revision: number, docId: string, version: number, timeoutMs: number): { since: number; deadline: number; decided: string | null } {
+    const existing = this.db
+      .prepare("SELECT * FROM index_waits WHERE task_id = ? AND input_revision = ? AND doc_id = ? AND version = ?")
+      .get(taskId, revision, docId, version) as { since: number; deadline: number; decided: string | null } | undefined;
+    if (existing) return existing;
+    const now = Date.now();
+    const row = { since: now, deadline: now + timeoutMs, decided: null as string | null };
+    this.db
+      .prepare("INSERT OR IGNORE INTO index_waits (task_id, input_revision, doc_id, version, since, deadline, decided) VALUES (?, ?, ?, ?, ?, ?, NULL)")
+      .run(taskId, revision, docId, version, row.since, row.deadline);
+    return row;
+  }
+
+  decideWait(taskId: string, revision: number, docId: string, version: number, decided: string): void {
+    this.db
+      .prepare("UPDATE index_waits SET decided = ? WHERE task_id = ? AND input_revision = ? AND doc_id = ? AND version = ?")
+      .run(decided, taskId, revision, docId, version);
+  }
+
+  /** 本修订内已被判定超时不可用的版本集合。 */
+  timedOutDocs(taskId: string, revision: number): Set<string> {
+    const rows = this.db
+      .prepare("SELECT doc_id, version FROM index_waits WHERE task_id = ? AND input_revision = ? AND decided = 'timeout'")
+      .all(taskId, revision) as Array<{ doc_id: string; version: number }>;
+    return new Set(rows.map((r) => `${r.doc_id}@${r.version}`));
   }
 
   // ===== task workspace files =====

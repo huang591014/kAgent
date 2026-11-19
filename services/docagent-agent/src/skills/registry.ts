@@ -8,11 +8,14 @@ import { installSkill, loadSkillBody, listPackageFiles, readPackageText, resolve
 import type { SkillPackage } from "./loader.js";
 
 export class SkillRegistry {
-  constructor(private readonly db: Db) {}
+  constructor(
+    private readonly db: Db,
+    private readonly skillsRoot: string = config.skillsDir,
+  ) {}
 
   /** 扫描 skills 根目录下的目录与 ZIP，安装未登记的包。 */
   scanRoot(): SkillPackage[] {
-    const root = config.skillsDir;
+    const root = this.skillsRoot;
     fs.mkdirSync(root, { recursive: true });
     const installed: SkillPackage[] = [];
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
@@ -29,7 +32,7 @@ export class SkillRegistry {
   }
 
   install(source: string): SkillPackage {
-    const pkg = installSkill(source);
+    const pkg = installSkill(source, this.skillsRoot);
     this.db.upsertSkill({
       ref: pkg.ref,
       name: pkg.manifest.name,
