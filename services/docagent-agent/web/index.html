@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DocAgent 合同审核</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>DocAgent · 合同合规审核</h1>
+    <div class="header-meta">
+      <label>租户 <input id="tenant" value="demo-tenant" size="10" /></label>
+      <label>用户 <input id="user" value="demo-user" size="10" /></label>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- 提交页 -->
+    <section id="submit-view">
+      <h2>提交审核任务</h2>
+      <form id="submit-form">
+        <label>场景说明（可选）
+          <input id="scenario" placeholder="例：信息技术采购合同用印审核" />
+        </label>
+        <label>审核 skill
+          <select id="skill"></select>
+        </label>
+        <fieldset>
+          <legend>材料（数字版 PDF / DOCX）</legend>
+          <div id="doc-rows"></div>
+          <button type="button" id="add-doc" class="secondary">＋ 添加材料</button>
+        </fieldset>
+        <button type="submit" id="submit-task">提交任务</button>
+        <span id="submit-status" class="status"></span>
+      </form>
+    </section>
+
+    <!-- 任务详情 -->
+    <section id="task-view" hidden>
+      <div class="task-head">
+        <h2>任务 <code id="task-id"></code></h2>
+        <div>
+          <span id="task-status" class="badge"></span>
+          <button id="cancel-task" class="danger" hidden>取消任务</button>
+          <a href="#" id="back">返回</a>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card" id="materials-card">
+          <h3>材料</h3>
+          <table id="materials-table">
+            <thead><tr><th>文件</th><th>版本</th><th>用途</th><th>状态</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card" id="progress-card">
+          <h3>进度</h3>
+          <div id="progress-body" class="muted">等待执行…</div>
+        </div>
+      </div>
+
+      <!-- 待补卡（设计 §4.6）-->
+      <div class="card pending-card" id="pending-card" hidden>
+        <h3>需要您补充</h3>
+        <p class="question" id="pending-question"></p>
+        <p class="impact" id="pending-impact"></p>
+        <div id="pending-files"></div>
+        <textarea id="pending-text" rows="3" placeholder="文字说明（可留空，若仅补文件）"></textarea>
+        <div class="row">
+          <input type="file" id="pending-file" multiple />
+        </div>
+        <div class="row">
+          <button id="pending-submit" class="primary">提交补充</button>
+          <button id="pending-finish" class="secondary">按现有材料出结果</button>
+          <span id="pending-status" class="status"></span>
+        </div>
+      </div>
+
+      <!-- 结果 -->
+      <div class="card" id="result-card" hidden>
+        <h3>审核结果 <span id="result-outcome" class="badge"></span></h3>
+        <div id="result-materials" class="muted small"></div>
+        <article id="result-md" class="markdown"></article>
+      </div>
+
+      <div class="card" id="terminal-card" hidden>
+        <h3>任务结束</h3>
+        <div id="terminal-body"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/vendor/marked.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -4,6 +4,12 @@ docagent-design*.md
 # Skill 分发内容（本地保留，不入库）
 合规审核Skill-分发包/
 
+# 运行数据（任务库、工作区、已安装 skill）
+var/
+
+# 本地环境
+.env
+
 # 通用开发排除项
 node_modules/
 dist/
@@ -12,8 +18,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-.env
+.pytest_cache/
 .idea/
 .vscode/
 *.log
+*.db
 .DS_Store
