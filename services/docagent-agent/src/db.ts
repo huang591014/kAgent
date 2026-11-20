@@ -212,7 +212,7 @@ export class Db {
     this.migrate();
   }
 
-  /** 轻量迁移：给旧库补新列。 */
+  /** 轻量迁移：补新列 + v0.6 单次提交切换（幂等）。 */
   private migrate(): void {
     const columns = (
       this.db.prepare("PRAGMA table_info(input_requests)").all() as Array<{ name: string }>
@@ -220,6 +220,39 @@ export class Db {
     if (!columns.includes("replace_target")) {
       this.db.exec("ALTER TABLE input_requests ADD COLUMN replace_target TEXT");
     }
+    const idemColumns = (
+      this.db.prepare("PRAGMA table_info(idempotency)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    if (!idemColumns.includes("payload_hash")) {
+      this.db.exec("ALTER TABLE idempotency ADD COLUMN payload_hash TEXT");
+    }
+    this.migrateToSingleSubmission();
+  }
+
+  /** v0.6 §5：旧 waiting_for_input 任务在同一事务内关卡、转 queued；
+   * 迁移幂等（源状态不存在即无操作），历史问句仅作记录，不作已核事实。 */
+  private migrateToSingleSubmission(): void {
+    const rows = this.db
+      .prepare("SELECT task_id, input_revision FROM tasks WHERE status = 'waiting_for_input'")
+      .all() as Array<{ task_id: string; input_revision: number }>;
+    if (rows.length === 0) return;
+    this.transaction(() => {
+      for (const row of rows) {
+        this.db
+          .prepare("UPDATE input_requests SET status = 'closed' WHERE task_id = ? AND status = 'open'")
+          .run(row.task_id);
+        this.db
+          .prepare(
+            "UPDATE tasks SET status = 'queued', input_closed = 1, status_reason = 'v0.6 迁移：切换为单次提交流程，按最后已接纳输入继续' WHERE task_id = ? AND status = 'waiting_for_input'",
+          )
+          .run(row.task_id);
+        this.appendEvent(row.task_id, "migrated_to_single_submission", {
+          from: "waiting_for_input",
+          input_revision: row.input_revision,
+        });
+      }
+    });
+    console.log(`[db] v0.6 迁移：${rows.length} 个待补任务已转 queued（按最后已接纳输入继续）`);
   }
 
   /** 原子领取：仅当任务仍为 queued 时置 running 并分配批次；返回是否领取成功。 */

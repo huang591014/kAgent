@@ -132,11 +132,81 @@ describe("B1 活动范围固定", () => {
   });
 });
 
+describe("v0.6 任务级缺口与无效产出判定", () => {
+  it("存在 route_undetermined 缺口时不能判 complete（共性全核也不行）", () => {
+    const papers = {
+      scope: { rule_cards: ["C1 共性"], expected_item_ids: ["a"] },
+      conclusion_hint: null,
+      task_gaps: [
+        { gap_id: "g1", category: "route_undetermined" as const, statement: "运维/外包无法判定", impact: "专项卡未执行" },
+      ],
+      items: [item()],
+    };
+    expect(determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] })).toBe("partial");
+  });
+
+  it("空底稿 / 普通待执行 → no_valid_output（不能推出缺材料）", () => {
+    expect(
+      determineOutcome(
+        { scope: null, conclusion_hint: null, task_gaps: [], items: [] },
+        { revisionMaterials: materials, materialIssues: [] },
+      ),
+    ).toBe("no_valid_output");
+    expect(
+      determineOutcome(
+        {
+          scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
+          conclusion_hint: null,
+          task_gaps: [],
+          items: [item({ status: "pending", finding: null, pending_reason: "待执行" })],
+        },
+        { revisionMaterials: materials, materialIssues: [] },
+      ),
+    ).toBe("no_valid_output");
+  });
+
+  it("complete 交付时无关附件失败进入【材料处理说明】", () => {
+    const papers = {
+      scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
+      conclusion_hint: null,
+      task_gaps: [],
+      items: [item()],
+    };
+    const issues = [
+      { doc_id: "d_02", version: 1, label: "附件-报价单.pdf", issue: "解析失败", impact: "与任何适用项无关" },
+    ];
+    const composed = composeConclusion({
+      papers,
+      outcome: determineOutcome(papers, { revisionMaterials: materials, materialIssues: issues }) as "complete",
+      ctx: { revisionMaterials: materials, materialIssues: issues },
+    });
+    expect(composed.review_outcome).toBe("complete");
+    expect(composed.conclusion_md).toContain("【材料处理说明】");
+    expect(composed.conclusion_md).toContain("附件-报价单.pdf");
+    expect(composed.conclusion_md).toContain("不影响本次已完成核查的范围");
+  });
+
+  it("task_gaps 校验：非法 category / 缺 statement / 引用修订外版本均被拒", () => {
+    const base = (gaps: unknown[]) => ({
+      scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
+      conclusion_hint: null,
+      task_gaps: gaps,
+      items: [item()],
+    });
+    expect(validatePapers(base([{ gap_id: "g1", category: "whatever", statement: "x", impact: "y" }]), materials, null).ok).toBe(false);
+    expect(validatePapers(base([{ gap_id: "g1", category: "missing_fact", impact: "y" }]), materials, null).ok).toBe(false);
+    expect(
+      validatePapers(base([{ gap_id: "g1", category: "file_issue", statement: "x", impact: "y", doc_id: "d_99", version: 9 }]), materials, null).ok,
+    ).toBe(false);
+  });
+});
+
 describe("B2 全部不适用", () => {
   it("全部不适用 → complete，结论写“本次规则均不适用”，逐项理由列出；hint 不覆盖", () => {
     const papers = {
       scope: { rule_cards: ["C1", "C2"], expected_item_ids: ["a", "b"] },
       conclusion_hint: "拟同意" as const,
+      task_gaps: [],
       items: [
         item({ item_id: "a", status: "not_applicable", not_applicable_reason: "本合同不涉及保密条款" }),
         item({ item_id: "b", status: "not_applicable", not_applicable_reason: "不涉及知识产权归属" }),
@@ -160,6 +230,7 @@ describe("B2 全部不适用", () => {
     const papers = {
       scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
       conclusion_hint: null,
+      task_gaps: [],
       items: [item()],
     };
     const composed = composeConclusion({

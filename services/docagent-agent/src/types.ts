@@ -1,11 +1,10 @@
 /** 共享类型：任务状态机、执行输入、working papers、结果对象。 */
 
-// ===== 任务状态（设计 §4.1）=====
+// ===== 任务状态（v0.6 §3：单次提交，无待补态）=====
 export type TaskStatus =
   | "queued"
   | "waiting_index"
   | "running"
-  | "waiting_for_input"
   | "completed"
   | "failed"
   | "cancelled";
@@ -14,7 +13,6 @@ export const TASK_STATUSES: readonly TaskStatus[] = [
   "queued",
   "waiting_index",
   "running",
-  "waiting_for_input",
   "completed",
   "failed",
   "cancelled",
@@ -105,9 +103,26 @@ export interface PapersScope {
   expected_item_ids: string[];
 }
 
+/** 任务级缺口（v0.6 §4）：可落在整个任务（如专项路径待确定），随底稿持久化恢复。 */
+export interface TaskGap {
+  gap_id: string;
+  category: "missing_material" | "missing_fact" | "file_issue" | "route_undetermined" | "budget";
+  /** 陈述句：现有材料支持哪些判断、缺什么 */
+  statement: string;
+  /** 对覆盖的影响 */
+  impact: string;
+  /** 已提交文件出现问题时记录；从未提交的材料只写 missing_role，不虚构文件标识 */
+  doc_id?: string;
+  version?: number;
+  label?: string;
+  missing_role?: string;
+}
+
 export interface PapersDoc {
   scope: PapersScope | null;
   items: PaperItem[];
+  /** 任务级缺口；专项路由未确定等全局缺口登记于此 */
+  task_gaps: TaskGap[];
   /** 模型给出的总体结论口径（拟同意/请修改后再提交/…），缺省由运行时推导 */
   conclusion_hint: string | null;
 }

@@ -4,7 +4,7 @@
 字段与状态匹配、材料版本属于当前任务修订。校验失败保留上一份有效快照。
 */
 
-import type { PaperItem, PapersDoc, PaperItemStatus } from "./types.js";
+import type { PaperItem, PapersDoc, PaperItemStatus, TaskGap } from "./types.js";
 
 export interface RevisionMaterialRef {
   doc_id: string;
@@ -206,6 +206,57 @@ export function validatePapers(
     }
   }
 
+  // 任务级缺口（v0.6 §4）：可落在整个任务，随底稿持久化；doc 引用须在修订内
+  const taskGaps: TaskGap[] = [];
+  const rawGaps = raw.task_gaps;
+  if (rawGaps !== null && rawGaps !== undefined) {
+    if (!Array.isArray(rawGaps)) {
+      errors.push("task_gaps 必须是数组");
+    } else {
+      const seenGapIds = new Set<string>();
+      for (const [index, entry] of (rawGaps as unknown[]).entries()) {
+        if (typeof entry !== "object" || entry === null) {
+          errors.push(`task_gaps[${index}] 不是对象`);
+          continue;
+        }
+        const g = entry as Record<string, unknown>;
+        const gapId = g.gap_id;
+        if (typeof gapId !== "string" || !gapId) {
+          errors.push(`task_gaps[${index}].gap_id 缺失`);
+          continue;
+        }
+        if (seenGapIds.has(gapId)) errors.push(`task_gaps gap_id 重复：${gapId}`);
+        seenGapIds.add(gapId);
+        const category = g.category as TaskGap["category"];
+        const validCategories = ["missing_material", "missing_fact", "file_issue", "route_undetermined", "budget"];
+        if (!validCategories.includes(category)) {
+          errors.push(`task_gaps ${gapId}.category 必须是 ${validCategories.join(" / ")} 之一`);
+          continue;
+        }
+        const statement = optionalString(g.statement);
+        const impact = optionalString(g.impact);
+        if (!statement) errors.push(`task_gaps ${gapId}.statement 缺失（用陈述句说明现有材料与缺口）`);
+        if (!impact) errors.push(`task_gaps ${gapId}.impact 缺失（说明对覆盖的影响）`);
+        const docId = optionalString(g.doc_id);
+        const version = typeof g.version === "number" ? g.version : undefined;
+        if (docId && version !== undefined && !knownMaterialKeys.has(`${docId}@${version}`)) {
+          errors.push(`task_gaps ${gapId} 引用了当前修订之外的材料版本：${docId}@${version}`);
+          continue;
+        }
+        taskGaps.push({
+          gap_id: gapId,
+          category,
+          statement: statement ?? "",
+          impact: impact ?? "",
+          ...(docId ? { doc_id: docId } : {}),
+          ...(version !== undefined ? { version } : {}),
+          ...(optionalString(g.label) ? { label: optionalString(g.label)! } : {}),
+          ...(optionalString(g.missing_role) ? { missing_role: optionalString(g.missing_role)! } : {}),
+        });
+      }
+    }
+  }
+
   let conclusionHint: string | null = null;
   if (raw.conclusion_hint !== null && raw.conclusion_hint !== undefined) {
     if (typeof raw.conclusion_hint !== "string" || !CONCLUSION_HINTS.includes(raw.conclusion_hint)) {
@@ -219,7 +270,7 @@ export function validatePapers(
 
   return {
     ok: true,
-    papers: { scope, items: parsedItems, conclusion_hint: conclusionHint },
+    papers: { scope, items: parsedItems, task_gaps: taskGaps, conclusion_hint: conclusionHint },
     scopeChanged,
   };
 }
@@ -249,6 +300,7 @@ export function enforceActiveScope(papers: PapersDoc, activeScope: ActiveScope |
     ...papers,
     scope: { rule_cards: activeScope.rule_cards, expected_item_ids: activeScope.expected_item_ids },
     items,
+    task_gaps: papers.task_gaps ?? [],
   };
 }
 
@@ -269,6 +321,8 @@ export interface CoverageStats {
   notApplicable: number;
   findings: number;
   applicable: number; // expected - notApplicable
+  /** 未解决的任务级缺口（如专项路由待确定）——存在则不能判 complete（v0.6 §4） */
+  openTaskGaps: TaskGap[];
 }
 
 export function coverageStats(papers: PapersDoc): CoverageStats {
@@ -286,6 +340,7 @@ export function coverageStats(papers: PapersDoc): CoverageStats {
     notApplicable: na.length,
     findings: checked.filter((i) => i.finding !== null).length,
     applicable: Math.max(0, expected - na.length),
+    openTaskGaps: papers.task_gaps ?? [],
   };
 }
 

@@ -61,24 +61,6 @@
         </div>
       </div>
 
-      <!-- 待补卡（设计 §4.6）-->
-      <div class="card pending-card" id="pending-card" hidden>
-        <h3>需要您补充</h3>
-        <p class="question" id="pending-question"></p>
-        <p class="impact" id="pending-impact"></p>
-        <p class="replace-hint" id="replace-hint" hidden></p>
-        <div id="pending-files"></div>
-        <textarea id="pending-text" rows="3" placeholder="文字说明（可留空，若仅补文件）"></textarea>
-        <div class="row">
-          <input type="file" id="pending-file" multiple />
-        </div>
-        <div class="row">
-          <button id="pending-submit" class="primary">提交补充</button>
-          <button id="pending-finish" class="secondary">按现有材料出结果</button>
-          <span id="pending-status" class="status"></span>
-        </div>
-      </div>
-
       <!-- 结果 -->
       <div class="card" id="result-card" hidden>
         <h3>审核结果 <span id="result-outcome" class="badge"></span></h3>

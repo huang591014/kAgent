@@ -1,8 +1,7 @@
-/** 工具集：schema 定义与执行分发（设计 §4.3）。
+/** 工具集：schema 定义与执行分发（v0.6 §2：单次提交的工具表）。
 
 - skill / list_dir / read_file：skill 包只读资源（路径约束在版本资源根内）
-- write_file / edit_file：仅写任务工作区；working-papers.json 写前校验
-- request_input：任务运行时工具，由 runner 拦截处理（本模块只提供 schema）
+- write_file / edit_file：仅写任务工作区；working-papers.json 写前校验（含 task_gaps）
 - doc_status / doc_outline：经 pipeline 查询（属主身份）
 - mcp__doc_retrieval__doc_search / doc_read：进程内 OpenSearch 检索
 工具结果与调用按原 ID 配对（参考 message-history.ts 的配对纪律）。
@@ -63,22 +62,6 @@ export const toolSchemas = {
       old_text: z.string().min(1),
       new_text: z.string(),
       replace_all: z.boolean().default(false),
-    }),
-  }),
-  request_input: tool({
-    description:
-      "向用户提出补充请求并暂停任务。仅在「缺失信息会改变规则卡选择」或「关键输入缺失使实质审核无法继续」时调用。question 面向用户能回答的业务事实；impact 说明这个答案影响哪一项判断。",
-    inputSchema: z.object({
-      question: z.string().min(1),
-      impact: z.string().min(1),
-      accepted_inputs: z
-        .array(z.enum(["text", "file"]))
-        .min(1)
-        .describe("接受的补充形式：text=文字，file=文件"),
-      replace_target: z
-        .object({ doc_id: z.string(), version: z.number().int().min(1) })
-        .optional()
-        .describe("替换文件时指明目标材料"),
     }),
   }),
   doc_status: tool({
@@ -167,8 +150,6 @@ export async function executeTool(name: string, args: Record<string, unknown>, c
         return ok(await runDocSearch(args, ctx));
       case "mcp__doc_retrieval__doc_read":
         return ok(await runDocRead(args, ctx));
-      case "request_input":
-        return err("request_input 由运行时处理，不应进入常规工具执行路径");
       default:
         return err(`未知工具：${name}`);
     }

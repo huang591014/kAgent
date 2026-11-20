@@ -6,8 +6,6 @@ const PIPELINE_BASE = localStorage.getItem("pipelineBase") || "http://localhost:
 const state = {
   taskId: null,
   pollTimer: null,
-  pendingUploads: [], // 待补卡上传的新增文件 → {doc_id, version, role, label}
-  currentPending: null,
 };
 
 /** 白名单净化（A3）：marked 输出的 HTML 只保留安全的标签与属性；
@@ -196,7 +194,6 @@ const STATUS_TEXT = {
   queued: "排队中",
   waiting_index: "等待材料处理",
   running: "审核进行中",
-  waiting_for_input: "等待您补充",
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
@@ -247,124 +244,12 @@ function renderTask(detail) {
 
   $("cancel-task").hidden = ["completed", "failed", "cancelled"].includes(detail.status);
 
-  // 待补卡
-  if (detail.status === "waiting_for_input" && detail.pending_input) {
-    renderPendingCard(detail.pending_input, detail);
-  } else {
-    $("pending-card").hidden = true;
-    state.currentPending = null;
-  }
 }
 
-function renderPendingCard(pending, detail) {
-  const card = $("pending-card");
-  if (state.currentPending?.request_id !== pending.request_id) {
-    state.currentPending = pending;
-    state.pendingUploads = [];
-    $("pending-question").textContent = pending.question;
-    $("pending-impact").textContent = pending.impact;
-    $("pending-text").value = "";
-    $("pending-file").value = "";
-    $("pending-status").textContent = "";
-    const acceptsFile = pending.accepted_inputs.includes("file");
-    $("pending-file").disabled = !acceptsFile;
-    if (!acceptsFile) $("pending-file").title = "该问题仅接受文字回答";
-    // B3：替换目标回显——上传的文件将替换该旧版本并沿用原用途
-    const replaceHint = $("replace-hint");
-    if (pending.replace_target) {
-      const target = pending.replace_target;
-      replaceHint.textContent = `本次上传将替换：${target.label}（v${target.version}，用途：${target.role || "未标注"}）。新文件就绪后原检查项将按新材料复核。`;
-      replaceHint.hidden = false;
-      $("pending-file").removeAttribute("multiple");
-    } else {
-      replaceHint.hidden = true;
-      $("pending-file").setAttribute("multiple", "");
-    }
-  }
-  card.hidden = false;
-}
 
-$("pending-file").onchange = async (event) => {
-  const files = [...event.target.files];
-  if (!files.length) return;
-  const status = $("pending-status");
-  const replaceTarget = state.currentPending?.replace_target;
-  try {
-    state.pendingUploads = [];
-    for (const file of files) {
-      status.textContent = `上传 ${file.name}…`;
-      if (replaceTarget) {
-        // B3：替换目标 → 上传为该文档的新版本
-        const resp = await fetch(`${PIPELINE_BASE}/api/v1/docs/${replaceTarget.doc_id}/versions`, {
-          method: "POST",
-          body: await fileToForm(file),
-          headers: identity(),
-        });
-        const body = await resp.json();
-        if (!resp.ok) throw new Error(body.detail || `上传失败 ${resp.status}`);
-        state.pendingUploads.push({
-          doc_id: body.doc_id,
-          version: body.version,
-          role: replaceTarget.role || "替换材料",
-          label: file.name,
-          replacing: replaceTarget,
-        });
-      } else {
-        const receipt = await uploadFile(file, "补充材料", { textContent: "" });
-        state.pendingUploads.push({ doc_id: receipt.doc_id, version: receipt.version, role: "补充材料", label: file.name });
-      }
-    }
-    status.textContent = `已上传 ${state.pendingUploads.length} 个文件（提交补充时一并生效）`;
-  } catch (error) {
-    status.textContent = `上传失败：${error.message}`;
-  }
-};
 
-async function fileToForm(file) {
-  const form = new FormData();
-  form.append("file", file);
-  return form;
-}
 
-async function submitPending(action) {
-  const pending = state.currentPending;
-  if (!pending) return;
-  const status = $("pending-status");
-  const button = action === "supplement" ? $("pending-submit") : $("pending-finish");
-  try {
-    button.disabled = true;
-    status.textContent = "提交中…";
-    const body = { request_id: pending.request_id, action };
-    if (action === "supplement") {
-      const text = $("pending-text").value.trim();
-      if (text) body.text = text;
-      // B3：带替换标记的上传走 replace_docs（旧回执 + 新回执 + 原用途），其余为新增
-      const replaceDocs = state.pendingUploads
-        .filter((u) => u.replacing)
-        .map((u) => ({ old: { doc_id: u.replacing.doc_id, version: u.replacing.version }, new: { doc_id: u.doc_id, version: u.version }, role: u.role, label: u.label }));
-      const addDocs = state.pendingUploads
-        .filter((u) => !u.replacing)
-        .map(({ doc_id, version, role, label }) => ({ doc_id, version, role, label }));
-      if (addDocs.length > 0) body.add_docs = addDocs;
-      if (replaceDocs.length > 0) body.replace_docs = replaceDocs;
-      if (!text && addDocs.length === 0 && replaceDocs.length === 0) {
-        throw new Error("请填写文字或上传文件");
-      }
-    }
-    await api(`/api/tasks/${state.taskId}/input`, { method: "POST", body: JSON.stringify(body) });
-    status.textContent = "已接纳";
-    $("pending-card").hidden = true;
-    state.currentPending = null;
-    startPolling();
-  } catch (error) {
-    status.textContent = `失败：${error.message}`;
-  } finally {
-    button.disabled = false;
-  }
-}
 
-$("pending-submit").onclick = () => void submitPending("supplement");
-$("pending-finish").onclick = () => void submitPending("finish_with_available");
 
 $("cancel-task").onclick = async () => {
   if (!confirm("确定取消该任务？")) return;

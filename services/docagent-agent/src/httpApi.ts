@@ -152,30 +152,6 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
       }
     }
 
-    const open = deps.db.openRequest(id);
-    let pendingInput: Record<string, unknown> | null = null;
-    if (open) {
-      pendingInput = {
-        request_id: open.request_id,
-        question: open.question,
-        impact: open.impact,
-        accepted_inputs: JSON.parse(open.accepted_inputs) as string[],
-      };
-      // B3：替换目标回显（含旧材料名与用途，前端据此展示替换流程）
-      const replaceTarget = (open as unknown as { replace_target?: string | null }).replace_target;
-      if (replaceTarget) {
-        const target = JSON.parse(replaceTarget) as { doc_id: string; version: number };
-        const material = materials.find((m) => m.doc_id === target.doc_id && m.version === target.version)
-          ?? materials.find((m) => m.doc_id === target.doc_id);
-        pendingInput.replace_target = {
-          doc_id: target.doc_id,
-          version: target.version,
-          label: material?.label ?? target.doc_id,
-          role: material?.role ?? "",
-        };
-      }
-    }
-
     return {
       task_id: id,
       status: task.status,
@@ -186,54 +162,24 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
       input_closed: task.input_closed === 1,
       materials: materialViews,
       progress,
-      pending_input: task.status === "waiting_for_input" ? pendingInput : null,
+      // v0.6：单次提交流程，无待补卡；旧客户端过渡读取固定为 null
+      pending_input: null,
       usage: JSON.parse(task.usage || "{}"),
       created_at: task.created_at,
       updated_at: task.updated_at,
     };
   });
 
+  // v0.6 §5：补件接口下线——鉴权后返回 410 与刷新提示，不产生任何写操作
   app.post("/api/tasks/:id/input", async (request, reply) => {
     const identity = identityHeaders(request as never);
     const { id } = request.params as { id: string };
     ensureTaskAccess(deps, identity, id);
-    const body = request.body as {
-      request_id?: string;
-      action?: string;
-      text?: string;
-      add_docs?: Array<{ doc_id: string; version: number; role?: string; label?: string }>;
-      replace_docs?: Array<{
-        old: { doc_id: string; version: number };
-        new: { doc_id: string; version: number };
-        role?: string;
-        label?: string;
-      }>;
-    } | null;
-    if (!body?.request_id || (body.action !== "supplement" && body.action !== "finish_with_available")) {
-      throw new AcceptConflictError(400, "需要 request_id 与 action（supplement / finish_with_available）", null);
-    }
-    // add/replace 文件校验访问权与版本存在性（设计 §4.2 新增文件）
-    for (const doc of body.add_docs ?? []) {
-      await assertDoc(identity, doc.doc_id, doc.version);
-    }
-    for (const rep of body.replace_docs ?? []) {
-      await assertDoc(identity, rep.new.doc_id, rep.new.version);
-    }
-    const result = taskService.acceptInput(
-      { db: deps.db },
-      identity,
-      id,
-      {
-        request_id: body.request_id,
-        action: body.action,
-        text: body.text,
-        add_docs: body.add_docs ?? [],
-        replace_docs: body.replace_docs ?? [],
-      },
-    );
-    deps.scheduler.kick();
-    void reply.status(202);
-    return result;
+    void reply.status(410);
+    return {
+      error: "补件接口已下线：任务为单次提交流程，不能追加输入。请刷新页面查看任务状态；需要补材料时请提交新任务。",
+      task_id: id,
+    };
   });
 
   app.get("/api/tasks/:id/result", async (request, reply) => {
@@ -338,15 +284,6 @@ export async function buildServer(deps: ApiDeps): Promise<FastifyInstance> {
   }
 
   return app;
-
-  async function assertDoc(identity: Identity, docId: string, version: number): Promise<void> {
-    try {
-      const status = await pipeline.docStatus(identity, docId, version);
-      if (status.version !== version) throw new Error("版本不匹配");
-    } catch (error) {
-      throw new AcceptConflictError(400, `材料校验失败 ${docId}@v${version}：${(error as Error).message}`, null);
-    }
-  }
 
   function progressOf(deps: ApiDeps, id: string): Record<string, unknown> | null {
     const checkpoint = deps.db.latestCheckpoint(id);

@@ -1,6 +1,6 @@
 # k-agent（DocAgent）
 
-证券公司合同合规审核平台。任务为中心的文本审核：用户提交材料，Agent 调用指定 skill 完成审核；遇到影响审核路径或阻止实质审核的缺口时，用户可在同一任务内补充文字或文件，也可选择按现有材料出结果。实现依据 [docagent-design-v0.5.md](../docagent-design-v0.5.md)（本地设计稿，不入库）。
+证券公司合同合规审核平台。**单次提交**的文本审核（v0.6）：用户上传材料并发起一次审核，Agent 用绑定的 skill 完成现有材料上可做的全部检查；缺少材料、合同类型不明或附件处理失败时继续可做的检查，把缺口及其影响写进本次结果，用户读完后自行决定是否发起新审核。实现依据 docagent-design-v0.6.md（本地设计稿，不入库）。
 
 ## 总体架构
 
@@ -110,7 +110,7 @@ curl -s -X POST localhost:8001/api/tasks -H 'content-type: application/json' \
 |---|---|
 | `POST /api/tasks` | `scenario, skill, docs[], idempotency_key?` → 任务与实际绑定版本 |
 | `GET /api/tasks/{id}` | 状态、输入修订、进度、材料问题；待补时返回 `pending_input` |
-| `POST /api/tasks/{id}/input` | 回应 `request_id`：`supplement`（文字 / add_docs / replace_docs）或 `finish_with_available` |
+| `POST /api/tasks/{id}/input` | **已下线（v0.6）**：返回 `410` 与刷新提示，不产生写操作 |
 | `GET /api/tasks/{id}/result` | `completed` 后返回 `conclusion_md` 等结果；执行中 202 |
 | `GET /api/tasks/{id}/events` | SSE（可选，前端也可仅轮询） |
 | `POST /api/tasks/{id}/cancel` | 取消非终态任务 |
@@ -123,9 +123,9 @@ pipeline（:8000）：`POST /api/v1/docs`、`POST /api/v1/docs/{id}/versions`、
 ## 测试
 
 ```bash
-cd services/docagent-agent && npm test       # vitest：模型替身 e2e（工具循环/待补恢复/原子领取）、
-                                             # 底稿校验与活动范围、覆盖判定与成文、skill 加载、
-                                             # 补件接纳协议、上下文预算、纯追问识别
+cd services/docagent-agent && npm test       # vitest：模型替身 e2e（工具循环/缺口登记/无效产出/原子领取）、
+                                             # 底稿校验与活动范围、task_gaps 校验、覆盖判定与成文、
+                                             # skill 加载、v0.6 迁移与取消、上下文预算、纯追问识别
 cd services/docagent-pipeline && .venv/Scripts/python -m pytest tests/ -q
                                              # pytest：条款切块、DOCX 解析、上传路由（替身 S3/元数据/队列）
 ```
@@ -134,6 +134,9 @@ cd services/docagent-pipeline && .venv/Scripts/python -m pytest tests/ -q
 
 - 输入为数字版 PDF / DOCX；扫描件标记 `needs_ocr` 暂不可读。XLSX/PPTX、OCR、Word 生成、子 Agent、语义检索（Milvus）均不在本期。
 - 结论正文始终由**运行时按 working-papers 组装**（模型成文与兜底成文同一路径）：空底稿或损坏写入不能产生“全部核查完毕”的统计；全部核查且无发现时必须附核查范围摘要；全部不适用是独立交付口径（“本次规则均不适用”+逐项理由），模型的 `conclusion_hint` 不覆盖该口径。
+- **单次提交，无用户交互**（v0.6）：`request_input` 工具、待补状态、补件接口与前端待补卡全部移除；缺材料/类型不明登记进底稿——检查项 `pending` 写明原因，任务级缺口写入 `task_gaps`（category：missing_material / missing_fact / file_issue / route_undetermined / budget），全局缺口参与覆盖判定（存在未解决缺口不能判 complete）并进入正文。
+- **insufficient/failed 判据收紧**（v0.6 §4）：零已核时只有“可明确指出的材料/事实缺口”才交付 `insufficient_materials`；空底稿、普通“待执行”、状态查询失败不能推出用户缺材料，交由运行时按 `failed` 收尾（无 `review_outcome`）。无关附件失败不影响 complete 交付，但正文必须列【材料处理说明】。
+- **历史任务迁移**：启动时旧 `waiting_for_input` 任务在同一事务内关闭待补卡、按最后已接纳输入转 `queued`（幂等，记 `migrated_to_single_submission` 事件）；新任务从首个输入版本起 `input_closed=1`。幂等创建增强：同键同内容（含并发）返回同一任务，同键不同内容 409。
 - **预期审查范围由运行时独立保存**（`task_scopes` 表，按任务 × 输入修订）：底稿内同步删改 expected 或删除待核项会被写入校验拒绝；路由确需变化必须携带 `scope_change_reason` 并重登记完整范围；统计与成文的分母始终取保存范围，底稿缺失项按待核兜底。
 - 模型消息以 AI SDK `ModelMessage` 为边界往返：assistant 的工具调用是 content 内 `tool-call` 块，tool 结果按原 ID 配对且包装为 `json / text / error-text`；待补暂停时同组未执行调用有明确跳过回执。
 - 执行领取以 `claimTask`（`status=queued` 条件更新）原子完成，定时 tick 与 kick 重叠时同一任务只有一个执行批次；批次贯穿检查点与结果发布，发布前校验批次、输入修订与状态。

@@ -59,7 +59,8 @@ describe("determineOutcome", () => {
     const papers: PapersDoc = {
       scope: null,
       conclusion_hint: null,
-      items: [item({ status: "pending", finding: null, pending_reason: "待合同类型确认" })],
+      task_gaps: [],
+      items: [item({ status: "pending", finding: null, pending_reason: "合同类型无法判定，无法确定适用规则" })],
     };
     expect(determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] })).toBe("insufficient_materials");
   });

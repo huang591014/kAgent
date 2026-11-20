@@ -1,25 +1,24 @@
-/** 任务执行循环（设计 §4.2 / §4.4）。
+/** 任务执行循环（v0.6 §2/§3：单次提交，无用户交互）。
 
 读取任务输入与最近完整检查点 → 判断材料可用性 → 调用模型 →
-工具调用配对执行 → request_input 暂停等待 → 输出意见时按底稿成文发布。
-发布前检查任务仍为有效批次、输入修订一致且未取消。
+工具调用配对执行 → 缺口登记进底稿（检查项 pending / 任务级 task_gaps）→
+按有效底稿成文发布。发布前检查任务仍为有效批次且未取消。
 */
 
 import { generateText } from "ai";
 import type { LanguageModel, ModelMessage } from "ai";
 import { config } from "../config.js";
 import type { Db, TaskRow } from "../db.js";
-import { newBatchId, newRequestId } from "../ids.js";
-import { determineOutcome, composeConclusion } from "../outcome.js";
+import { newBatchId } from "../ids.js";
+import { composeConclusion, determineOutcome } from "../outcome.js";
 import type { MaterialIssue, PapersDoc, StoredMessage, TaskUsage } from "../types.js";
-import { coverageStats, enforceActiveScope, validatePapers, type ActiveScope } from "../papers.js";
+import { coverageStats, enforceActiveScope, type ActiveScope } from "../papers.js";
 import type { SkillRegistry } from "../skills/registry.js";
 import type { OpenSearchRetrieval } from "../opensearch.js";
-import { pipeline, type DocVersionStatus } from "../pipelineClient.js";
-import { fitMessagesToBudget, estimateTokens } from "./context.js";
+import { pipeline } from "../pipelineClient.js";
+import { fitMessagesToBudget } from "./context.js";
 import { chatModel, modelCallOptions } from "./model.js";
 import { executeTool, toolSchemas, WORKING_PAPERS_PATH, type ToolContext } from "./tools.js";
-import { z } from "zod";
 
 export interface RunnerDeps {
   db: Db;
@@ -33,15 +32,6 @@ export interface RunnerDeps {
   modelFactory?: () => LanguageModel;
 }
 
-const requestInputSchema = z.object({
-  question: z.string().min(1),
-  impact: z.string().min(1),
-  accepted_inputs: z.array(z.enum(["text", "file"])).min(1),
-  replace_target: z
-    .object({ doc_id: z.string(), version: z.number().int().min(1) })
-    .optional(),
-});
-
 class CancelledError extends Error {
   constructor() {
     super("任务已取消");
@@ -50,16 +40,12 @@ class CancelledError extends Error {
 
 export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
   const { db } = deps;
-  const controller = new AbortController();
-  deps.activeRuns.set(taskId, controller);
-
-  // 原子领取（C1）：仅当任务仍为 queued 时占用执行槽并分配批次，防止并发派发双跑
+  // 原子领取（v0.6 §3：领取成功后再绑定取消句柄）
   const batch = newBatchId();
   const claim = db.claimTask(taskId, batch);
-  if (!claim.claimed || !claim.task) {
-    deps.activeRuns.delete(taskId);
-    return;
-  }
+  if (!claim.claimed || !claim.task) return;
+  const controller = new AbortController();
+  deps.activeRuns.set(taskId, controller);
   const task = claim.task;
   const startedAt = Date.now();
 
@@ -154,35 +140,17 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
       // ===== 工具调用处理：每个调用恰好一条回执，tool 消息只写一次 =====
       if (result.toolCalls.length > 0) {
         const toolBlocks: Array<Record<string, unknown>> = [];
-        let pausePlan: PausePlan | null = null;
         for (const call of result.toolCalls) {
-          if (call.toolName === "request_input") {
-            const prepared = prepareRequestInput(deps, ctx, call.toolCallId, call.input as unknown);
-            toolBlocks.push(prepared.block);
-            if (prepared.pause) pausePlan = prepared.pause;
-            if (pausePlan) {
-              // 暂停后同组剩余调用给出明确的跳过回执
-              toolBlocks.push(...skippedBlocks(result.toolCalls, call.toolCallId));
-              break;
-            }
-          } else {
-            const executed = await executeTool(call.toolName, call.input as Record<string, unknown>, ctx);
-            toolBlocks.push({
-              type: "tool-result",
-              toolCallId: call.toolCallId,
-              toolName: call.toolName,
-              output: executed.output,
-              isError: executed.isError,
-            });
-          }
+          const executed = await executeTool(call.toolName, call.input as Record<string, unknown>, ctx);
+          toolBlocks.push({
+            type: "tool-result",
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            output: executed.output,
+            isError: executed.isError,
+          });
         }
         messages.push({ role: "tool", content: toolBlocks });
-
-        if (pausePlan) {
-          // 待补落库（单事务）：保存请求、检查点（含配对回执）与待补状态
-          commitRequestInput(deps, ctx, pausePlan, messages, usage);
-          return; // 释放执行槽
-        }
         saveCheckpoint(deps, taskId, batch, messages, effectivePapers(ctx), usage);
         db.appendEvent(taskId, "progress", {
           step: usage.steps,
@@ -191,13 +159,13 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
         continue;
       }
 
-      // ===== 无工具调用：成文或追问修正 =====
+      // ===== 无工具调用：成文或追问修正（v0.6 §2：只在服务端给一次纠正机会）=====
       if (isFollowUpOnly(assistantText) && !nudgedOnce) {
         nudgedOnce = true;
         messages.push({
           role: "user",
           content:
-            "刚才的回复只包含追问，不能作为交付。请选择有效动作：需要用户补充时调用 request_input 工具；已有充分内容时，完成 working-papers.json 中各检查项的核对后直接结束（无需再输出全文，运行时会按底稿成文）。",
+            "刚才的回复只包含追问，不能作为交付。本流程不与用户交互：请继续可做的检查；确有缺口时，把缺什么、影响哪项判断登记进 working-papers.json（对应检查项标 pending 并写明原因，任务级缺口写入 task_gaps），然后直接结束（无需输出全文，运行时会按底稿成文）。",
         });
         continue;
       }
@@ -211,11 +179,7 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
     }
   } catch (error) {
     if (error instanceof CancelledError || controller.signal.aborted) {
-      db.transaction(() => {
-        db.updateTask(taskId, { status: "cancelled", status_reason: "用户取消" });
-        const open = db.openRequest(taskId);
-        if (open) db.settleRequest(open.request_id, "closed", null, null);
-      });
+      db.updateTask(taskId, { status: "cancelled", status_reason: "用户取消" });
       db.appendEvent(taskId, "task_cancelled", {});
     } else {
       const stats = coverageStats(effectivePapers(ctx));
@@ -233,155 +197,6 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
     deps.activeRuns.delete(taskId);
     deps.onSettled?.(taskId);
   }
-}
-
-// ===== request_input（设计 §4.2 提问上限 / 怎样恢复）=====
-// 拆成两步：prepare 做纯决策（参数/幂等/上限），commit 在外层写完唯一的 tool 消息后
-// 于单事务内落库——回执只写一次，检查点里带的就是配对后的消息。
-
-interface PausePlan {
-  requestId: string;
-  toolCallId: string;
-  seq: number;
-  data: z.infer<typeof requestInputSchema>;
-  reuseExisting: boolean;
-}
-
-interface RequestInputPrepared {
-  block: Record<string, unknown>;
-  pause: PausePlan | null;
-}
-
-function prepareRequestInput(
-  deps: RunnerDeps,
-  ctx: ToolContext,
-  toolCallId: string,
-  input: unknown,
-): RequestInputPrepared {
-  const { db } = deps;
-  const parsed = requestInputSchema.safeParse(input);
-  if (!parsed.success) {
-    return {
-      pause: null,
-      block: {
-        type: "tool-result",
-        toolCallId,
-        toolName: "request_input",
-        isError: true,
-        output: { message: "参数校验失败（question/impact/accepted_inputs），请修正后重试。", issues: z.treeifyError(parsed.error) },
-      },
-    };
-  }
-
-  // 幂等：同一 tool_call_id 复用已创建的卡（服务重启 / 前端刷新 / 重试）
-  const existing = db.getRequestByToolCall(ctx.task.task_id, toolCallId);
-  if (existing) {
-    return {
-      pause: existing.status === "open"
-        ? { requestId: existing.request_id, toolCallId, seq: existing.seq, data: parsed.data, reuseExisting: true }
-        : null,
-      block: {
-        type: "tool-result",
-        toolCallId,
-        toolName: "request_input",
-        output: {
-          request_id: existing.request_id,
-          status: existing.status,
-          message: existing.status === "open" ? "该提问已登记，任务进入待补状态。" : "该提问已处理。",
-        },
-      },
-    };
-  }
-
-  if (ctx.task.input_closed) {
-    return {
-      pause: null,
-      block: {
-        type: "tool-result",
-        toolCallId,
-        toolName: "request_input",
-        isError: true,
-        output: {
-          message:
-            "提问入口已关闭（用户已选择按现有材料出结果，或已达提问上限）。请基于现有材料完成可做的检查，在底稿中记录剩余缺口后结束。",
-        },
-      },
-    };
-  }
-
-  const count = db.countRequests(ctx.task.task_id);
-  if (count >= config.requestInputLimit) {
-    db.updateTask(ctx.task.task_id, { input_closed: 1 });
-    ctx.task.input_closed = 1;
-    return {
-      pause: null,
-      block: {
-        type: "tool-result",
-        toolCallId,
-        toolName: "request_input",
-        isError: true,
-        output: {
-          message: `已达提问上限（${config.requestInputLimit} 张待补卡）。本任务提问入口已关闭：请按现有材料完成可做的检查，并在底稿与结果中说明剩余缺口。`,
-        },
-      },
-    };
-  }
-
-  return {
-    pause: { requestId: newRequestId(), toolCallId, seq: count + 1, data: parsed.data, reuseExisting: false },
-    block: {
-      type: "tool-result",
-      toolCallId,
-      toolName: "request_input",
-      output: { message: "已向用户提出补充请求，任务即将暂停等待补充。" },
-    },
-  };
-}
-
-function commitRequestInput(
-  deps: RunnerDeps,
-  ctx: ToolContext,
-  plan: PausePlan,
-  messages: StoredMessage[],
-  usage: TaskUsage,
-): void {
-  const { db } = deps;
-  db.transaction(() => {
-    if (!plan.reuseExisting) {
-      db.createRequest({
-        request_id: plan.requestId,
-        task_id: ctx.task.task_id,
-        tool_call_id: plan.toolCallId,
-        seq: plan.seq,
-        question: plan.data.question,
-        impact: plan.data.impact,
-        accepted_inputs: plan.data.accepted_inputs,
-        status: "open",
-        answer: null,
-        answer_identity: null,
-        created_at: Date.now(),
-        answered_at: null,
-        ...(plan.data.replace_target ? { replace_target: plan.data.replace_target } : {}),
-      });
-    }
-    saveCheckpoint(deps, ctx.task.task_id, ctx.task.current_batch!, messages, effectivePapers(ctx), usage);
-    db.updateTask(ctx.task.task_id, { status: "waiting_for_input" });
-    db.appendEvent(ctx.task.task_id, "input_requested", { request_id: plan.requestId });
-  });
-}
-
-/** 暂停后同组未执行调用的跳过回执（每个调用恰好一条结果，保持配对完整）。 */
-function skippedBlocks(calls: ReadonlyArray<{ toolCallId: string; toolName: string }>, afterCallId: string): Array<Record<string, unknown>> {
-  const index = calls.findIndex((c) => c.toolCallId === afterCallId);
-  return calls
-    .slice(index + 1)
-    .map((call) => ({
-      type: "tool-result",
-      toolCallId: call.toolCallId,
-      toolName: call.toolName,
-      isError: true,
-      output: { message: "任务因待补暂停，本调用未执行；恢复后请按需重新发起。" },
-    }));
 }
 
 /** 统计/落库用底稿：以运行时保存的活动范围为准（缺失项按待核兜底）。 */
@@ -405,10 +220,18 @@ async function finalize(
   const papers = effectivePapers(ctx);
   const materialIssues = buildMaterialIssues(ctx);
   const stats = coverageStats(papers);
-  const allUnreadable = ctx.materials.length > 0 && ctx.materials.every((m) => {
-    const cached = ctx.docStatusCache.get(`${m.doc_id}@${m.version}`);
-    return !cached?.ready;
-  });
+  const timedOut = db.timedOutDocs(taskId, ctx.task.input_revision);
+  // v0.6 §4：只有**明确**不可读（失败/扫描件/等待超时）才计入；状态查询失败不算
+  const clearlyUnreadable = (docId: string, version: number): boolean => {
+    const cached = ctx.docStatusCache.get(`${docId}@${version}`);
+    if (!cached || cached.ready) return false;
+    if (cached.status === "unknown") return false;
+    if (["uploaded", "parsing", "structuring", "indexing"].includes(cached.status)) {
+      return timedOut.has(`${docId}@${version}`);
+    }
+    return true; // failed / needs_ocr
+  };
+  const allUnreadable = ctx.materials.length > 0 && ctx.materials.every((m) => clearlyUnreadable(m.doc_id, m.version));
 
   const outcome = determineOutcome(papers, {
     revisionMaterials: ctx.materials,
@@ -416,7 +239,15 @@ async function finalize(
     allMaterialsUnreadable: allUnreadable,
   });
 
-  // 执行故障/预算耗尽，既无可用实质审核结果、也无材料不足事实 → 任务失败（设计 §5 末段）
+  if (outcome === "no_valid_output") {
+    // v0.6 §4：无已证实的材料/事实缺口，也无可用审核结果 → failed（含空底稿/普通待执行/状态查询失败的情形）
+    const reason = extraNotes[0] ?? "未产出有效审核结果（无已核项，也无已证实的材料或事实缺口）";
+    db.updateTask(taskId, { status: "failed", status_reason: reason.slice(0, 500) });
+    db.appendEvent(taskId, "task_failed", { reason });
+    return;
+  }
+
+  // 执行故障/预算耗尽，既无可用实质审核结果、也无材料不足事实 → 任务失败（v0.6 §4 表末行）
   if (executionBlocked && stats.checked === 0 && stats.findings === 0 && outcome !== "insufficient_materials") {
     db.updateTask(taskId, { status: "failed", status_reason: extraNotes[0] ?? "无可用审核结果" });
     db.appendEvent(taskId, "task_failed", { reason: extraNotes[0] ?? "无可用审核结果" });
@@ -536,13 +367,19 @@ function buildMaterialIssues(ctx: ToolContext): MaterialIssue[] {
 // ===== 消息与底稿装载 =====
 
 function loadPapers(db: Db, taskId: string): PapersDoc {
+  const empty: PapersDoc = { scope: null, items: [], task_gaps: [], conclusion_hint: null };
   const file = db.getFile(taskId, WORKING_PAPERS_PATH);
-  if (!file) return { scope: null, items: [], conclusion_hint: null };
+  if (!file) return empty;
   try {
     const parsed = JSON.parse(file.content);
-    return { scope: parsed.scope ?? null, items: parsed.items ?? [], conclusion_hint: parsed.conclusion_hint ?? null };
+    return {
+      scope: parsed.scope ?? null,
+      items: parsed.items ?? [],
+      task_gaps: Array.isArray(parsed.task_gaps) ? parsed.task_gaps : [],
+      conclusion_hint: parsed.conclusion_hint ?? null,
+    };
   } catch {
-    return { scope: null, items: [], conclusion_hint: null };
+    return empty;
   }
 }
 
@@ -574,52 +411,15 @@ function restoreMessages(deps: RunnerDeps, ctx: ToolContext, task: TaskRow): Sto
     materialsBrief || "（无材料，仅有文字说明）",
     "",
     "请先加载 skill、查看材料状态与目录，确定审查路径后在 working-papers.json 登记 scope 与预期检查项（全部初始 pending），逐项核查并更新，全部完成后结束。",
+    "本流程为单次提交：缺材料或类型不明时继续可做的检查，把缺口登记进底稿（pending 原因 / task_gaps）后结束。",
   ].join("\n");
 
   if (!checkpoint) {
     return [{ role: "user", content: initialBrief }];
   }
 
-  const messages = JSON.parse(checkpoint.messages) as StoredMessage[];
-
-  // 恢复待补回答后的上下文：追加用户补充消息
-  const answered = findLatestAnswer(deps, task.task_id, task.input_revision);
-  if (answered) {
-    const lines: string[] = [`【用户补充】（request_id=${answered.request_id}）`];
-    if (answered.receipt.text) lines.push(`文字回答：${answered.receipt.text}`);
-    for (const doc of answered.receipt.add_docs) {
-      lines.push(`新增材料：${doc.label ?? doc.doc_id}（doc_id=${doc.doc_id}，v${doc.version}，用途=${doc.role}）`);
-    }
-    for (const rep of answered.receipt.replace_docs) {
-      lines.push(`替换材料：${rep.old.doc_id}@v${rep.old.version} → ${rep.new.doc_id}@v${rep.new.version}（用途=${rep.role}）；引用旧版本的意见已标记为待复核`);
-    }
-    if (answered.receipt.action === "finish_with_available") {
-      lines.push("用户决定：按现有材料出结果。本任务已关闭后续补充请求，请完成可做的核查并在底稿中记录剩余缺口后结束。");
-    } else {
-      lines.push("请按当前规则卡复核受影响的检查项（missing_role 匹配或原为待核的事项），更新底稿后继续。");
-    }
-    messages.push({ role: "user", content: lines.join("\n") });
-  }
-
-  return messages;
-}
-
-function findLatestAnswer(deps: RunnerDeps, taskId: string, revision: number): { request_id: string; receipt: NonNullable<import("../types.js").InputAnswerReceipt> } | null {
-  const { db } = deps;
-  const rows = db.db
-    .prepare(
-      "SELECT request_id, answer FROM input_requests WHERE task_id = ? AND status = 'answered' ORDER BY answered_at DESC LIMIT 5",
-    )
-    .all(taskId) as Array<{ request_id: string; answer: string }>;
-  for (const row of rows) {
-    try {
-      const receipt = JSON.parse(row.answer) as import("../types.js").InputAnswerReceipt;
-      if (receipt.accepted_revision === revision) return { request_id: row.request_id, receipt };
-    } catch {
-      /* 跳过损坏回执 */
-    }
-  }
-  return null;
+  // v0.6：单次提交，无补件恢复路径；历史消息（含 v0.5 迁移任务的旧问句）原样作为上下文
+  return JSON.parse(checkpoint.messages) as StoredMessage[];
 }
 
 function saveCheckpoint(deps: RunnerDeps, taskId: string, batch: string, messages: StoredMessage[], papers: PapersDoc, usage: TaskUsage): void {
@@ -640,16 +440,17 @@ function buildSystemPrompt(deps: RunnerDeps, ctx: ToolContext): string {
   const parts: string[] = [];
   parts.push(
     [
-      "你是 DocAgent 平台的合同合规审核 Agent。你的工作是按绑定的 skill 完成材料审查，并把过程与结论落到任务工作区的 working-papers.json 底稿。",
+      "你是 DocAgent 平台的合同合规审核 Agent。本次审核为单次提交：不与用户交互、不能提问或等待补充。你的工作是按绑定的 skill 完成现有材料上可做的全部检查，把过程、结论与缺口落到任务工作区的 working-papers.json 底稿。",
       "",
       "工作纪律：",
       "1. 先用 skill 工具加载技能正文，用 doc_status / doc_outline 了解材料，再开始审查。",
-      "2. 确定审查路径后，立即在 working-papers.json 登记 scope（rule_cards + expected_item_ids）并为每个预期检查项建立 pending 记录。",
-      `3. 底稿用 write_file / edit_file 维护，路径必须是 ${WORKING_PAPERS_PATH}。每核完一项即更新：状态 checked（finding 填 problem+suggestion，可附 location/basis）、pending（pending_reason+missing_role）、not_applicable（not_applicable_reason）。实际使用的材料记入 used_materials。`,
-      "4. 只有「缺失信息会改变规则卡选择」或「关键输入缺失使实质审核无法继续」时才调用 request_input 提问；问题面向用户能回答的业务事实，并说明影响哪项判断。最多 3 次提问。",
-      "5. 单份材料失败不阻塞其余审查：继续可审内容，相关项保持 pending 并注明原因。",
-      "6. 全部检查项处理完毕后直接结束输出简短总结即可——最终意见书由运行时按底稿组装，正文中的材料引用注明所用材料（文件）即可，不需要定位到段落或条款。",
-      "7. 不要在正文中向用户追问业务事实——等待用户回答必须通过 request_input 工具。",
+      "2. 确定审查路径后，立即在 working-papers.json 登记 scope（rule_cards + expected_item_ids）并为每个预期检查项建立 pending 记录。合同类型不明时：先完成能确定的共性/非标兜底规则，专项适用性无法确定的缺口写入 task_gaps（category=route_undetermined）。",
+      `3. 底稿用 write_file / edit_file 维护，路径必须是 ${WORKING_PAPERS_PATH}。每核完一项即更新：状态 checked（finding 填 problem+suggestion，可附 location/basis）、pending（pending_reason 写清涉及判断与具体原因：缺材料/缺事实/文件处理失败）、not_applicable（not_applicable_reason）。实际使用的材料记入 used_materials。`,
+      "4. 缺材料（如采购纪要）只影响依赖它的检查项：这些项保持 pending 并写明原因与影响；从未提交的材料只写用途（missing_role），不要虚构文件标识。",
+      "5. 任务级缺口（专项路由待确定、关键事实缺失、已提交文件处理失败但不落在具体检查项）写入底稿的 task_gaps 数组：gap_id、category（missing_material/missing_fact/file_issue/route_undetermined/budget）、statement（陈述句：现有材料支持什么、缺什么）、impact。",
+      "6. 单份材料失败不阻塞其余审查：继续可审内容。检索无命中时先查目录或通读相关范围，再判断条款是否缺失。",
+      "7. 全部处理完毕后直接结束输出简短总结即可——最终意见书由运行时按底稿组装，正文中的材料引用注明所用材料（文件）即可，不需要定位到段落或条款。",
+      "8. 任何时候都不要向用户提问或要求补充——缺口登记进底稿即可，用户会在结果中看到。",
     ].join("\n"),
   );
   parts.push(deps.skills.manifestListing());
@@ -739,5 +540,3 @@ function toToolResultContent(
   if (typeof output === "object") return { type: "json", value: output };
   return { type: "json", value: { value: output } };
 }
-
-export { validatePapers, estimateTokens };
