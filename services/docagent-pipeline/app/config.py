@@ -51,6 +51,10 @@ class Settings:
     s3_force_path_style: bool = field(
         default_factory=lambda: _get("S3_FORCE_PATH_STYLE", "true").lower() in ("1", "true", "yes")
     )
+    # ECS 按签名 scope 的 region 路由，必须与网关配置一致（如 bsc）
+    s3_region: str = field(default_factory=lambda: _get("S3_REGION", "us-east-1"))
+    # 可选：部分 ECS 部署需要 x-emc-namespace 头路由到账户 namespace；留空则不注入
+    s3_namespace: str = field(default_factory=lambda: _get("S3_NAMESPACE", ""))
 
     opensearch_url: str = field(default_factory=lambda: _get("OPENSEARCH_URL", "http://localhost:9200"))
     opensearch_user: str = field(default_factory=lambda: _get("OPENSEARCH_USER", ""))

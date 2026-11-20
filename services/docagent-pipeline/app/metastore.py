@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from opensearchpy import OpenSearch
 
@@ -19,12 +20,15 @@ TERMINAL_STATUSES = ("ready", "failed", "needs_ocr")
 
 
 def os_client() -> OpenSearch:
+    # URL 不带端口时 opensearch-py 会默认拼 9200；LB 场景（80/443）需显式解析
+    parsed = urlparse(settings.opensearch_url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     return OpenSearch(
-        hosts=[settings.opensearch_url],
+        hosts=[{"host": parsed.hostname, "port": port, "scheme": parsed.scheme}],
         http_auth=(settings.opensearch_user, settings.opensearch_password)
         if settings.opensearch_user
         else None,
-        use_ssl=settings.opensearch_url.startswith("https"),
+        use_ssl=parsed.scheme == "https",
         verify_certs=False,
     )
 
