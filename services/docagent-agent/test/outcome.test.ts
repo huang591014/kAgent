@@ -55,14 +55,26 @@ describe("determineOutcome", () => {
     ).toBe("insufficient_materials");
   });
 
-  it("路径未确定且无已核 → insufficient_materials", () => {
+  it("路径未确定且无已核（结构性事实缺口）→ insufficient_materials", () => {
+    const papers: PapersDoc = {
+      scope: null,
+      conclusion_hint: null,
+      task_gaps: [
+        { gap_id: "g1", category: "missing_fact", statement: "材料无法判定合同类型", impact: "无法确定适用规则" },
+      ],
+      items: [],
+    };
+    expect(determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] })).toBe("insufficient_materials");
+  });
+
+  it("纯文本 pending_reason 不再构成缺材料证据（技术原因文本 → no_valid_output）", () => {
     const papers: PapersDoc = {
       scope: null,
       conclusion_hint: null,
       task_gaps: [],
-      items: [item({ status: "pending", finding: null, pending_reason: "合同类型无法判定，无法确定适用规则" })],
+      items: [item({ status: "pending", finding: null, pending_reason: "执行预算已耗尽" })],
     };
-    expect(determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] })).toBe("insufficient_materials");
+    expect(determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] })).toBe("no_valid_output");
   });
 
   it("全部不适用且各有理由 → complete", () => {

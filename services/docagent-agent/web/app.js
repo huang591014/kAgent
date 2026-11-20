@@ -47,18 +47,22 @@ function sanitizeHtmlNode(node) {
 }
 
 function renderMarkdown(container, markdownText) {
-  if (typeof marked?.parse !== "function") {
+  const parser = globalThis.marked;
+  try {
+    if (!parser || typeof parser.parse !== "function") throw new Error("renderer unavailable");
+    const raw = parser.parse(markdownText, { breaks: true });
+    const template = document.createElement("template");
+    template.innerHTML = raw;
+    sanitizeHtmlNode(template.content);
+    container.replaceChildren(template.content);
+    return;
+  } catch {
+    // 渲染器缺失或渲染异常：降级为纯文本，保证结论仍可读
     const pre = document.createElement("pre");
     pre.className = "markdown-fallback";
     pre.textContent = markdownText;
     container.replaceChildren(pre);
-    return;
   }
-  const raw = marked.parse(markdownText, { breaks: true });
-  const template = document.createElement("template");
-  template.innerHTML = raw;
-  sanitizeHtmlNode(template.content);
-  container.replaceChildren(template.content);
 }
 
 const identity = () => ({
@@ -89,7 +93,19 @@ function showTask(taskId) {
   $("submit-view").hidden = true;
   $("task-view").hidden = false;
   state.taskId = taskId;
+  resetTaskView();
   startPolling();
+}
+
+/** P2：切换任务时清空上一份结果/终态/进度，旧轮询响应按任务号丢弃 */
+function resetTaskView() {
+  $("result-card").hidden = true;
+  $("terminal-card").hidden = true;
+  $("result-md").replaceChildren();
+  $("result-materials").textContent = "";
+  $("terminal-body").replaceChildren();
+  $("progress-body").textContent = "等待执行…";
+  $("materials-table").querySelector("tbody").replaceChildren();
 }
 
 window.addEventListener("hashchange", () => route());
@@ -159,14 +175,11 @@ $("submit-form").onsubmit = async (event) => {
       const receipt = await uploadFile(file.files[0], role, row.querySelector(".status"));
       docs.push({ doc_id: receipt.doc_id, version: receipt.version, role, label: file.files[0].name });
     }
-    const skills = await api("/api/skills");
-    const skillSelect = $("skill");
-    const chosen = skills.skills.find((s) => s.ref === skillSelect.value);
     const created = await api("/api/tasks", {
       method: "POST",
       body: JSON.stringify({
         scenario: $("scenario").value.trim(),
-        skill: chosen?.name || skillSelect.value || "",
+        skill: $("skill").value || "", // P1-8：原样提交所选 ref（name@version）
         docs,
       }),
     });
@@ -201,12 +214,14 @@ const STATUS_TEXT = {
 
 async function refreshTask() {
   if (!state.taskId) return;
+  const requestedTask = state.taskId;
   try {
-    const detail = await api(`/api/tasks/${state.taskId}`);
+    const detail = await api(`/api/tasks/${requestedTask}`);
+    if (state.taskId !== requestedTask) return; // 过期响应（已切换任务）
     renderTask(detail);
     if (["completed", "failed", "cancelled"].includes(detail.status)) {
       stopPolling();
-      await renderResult(detail.status);
+      if (state.taskId === requestedTask) await renderResult(detail.status);
     }
   } catch (error) {
     console.error(error);

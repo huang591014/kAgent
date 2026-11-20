@@ -62,6 +62,7 @@ function makeFakeModel(responses: FakeResponse[]) {
 let baseDir: string;
 let db: Db;
 let skills: SkillRegistry;
+let installedSkillRef = "demo-skill@x";
 
 beforeEach(() => {
   baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-e2e-"));
@@ -71,7 +72,7 @@ beforeEach(() => {
   const pkgDir = path.join(baseDir, "src-demo-skill");
   fs.mkdirSync(pkgDir, { recursive: true });
   fs.writeFileSync(path.join(pkgDir, "SKILL.md"), "---\nname: demo-skill\ndescription: 演示\n---\n# 演示技能\n");
-  skills.install(pkgDir);
+  installedSkillRef = skills.install(pkgDir).ref;
 });
 
 afterEach(() => {
@@ -79,15 +80,15 @@ afterEach(() => {
   fs.rmSync(baseDir, { recursive: true, force: true });
 });
 
-function seedTask(): string {
+function seedTask(skillRef: string = installedSkillRef): string {
   const taskId = "task_e2e01";
   const now = Date.now();
   db.db
     .prepare(
-      `INSERT INTO tasks (task_id, tenant_id, submitted_by, scenario, skill_ref, config_snapshot, status, input_revision, current_batch, input_closed, usage, status_reason, created_at, updated_at)
-       VALUES (?, 't1', 'u1', '', 'demo-skill@x', '{}', 'queued', 1, NULL, 1, '{}', NULL, ?, ?)`,
+      `INSERT INTO tasks (task_id, tenant_id, submitted_by, is_admin, scenario, skill_ref, config_snapshot, status, input_revision, current_batch, input_closed, usage, status_reason, created_at, updated_at)
+       VALUES (?, 't1', 'u1', 0, '', ?, '{}', 'queued', 1, NULL, 1, '{}', NULL, ?, ?)`,
     )
-    .run(taskId, now, now);
+    .run(taskId, skillRef, now, now);
   return taskId;
 }
 
@@ -170,6 +171,7 @@ describe("runTask（模型替身 e2e，v0.6 单次提交）", () => {
       { toolCalls: [{ id: "call_2", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
       { text: "审核完成，意见如底稿所述。" },
     ]);
+    // 绑定真实安装的 skill 版本（P1-1：成功加载是发布凭据）
 
     await runTask(depsFor(model), taskId);
 
@@ -189,6 +191,7 @@ describe("runTask（模型替身 e2e，v0.6 单次提交）", () => {
   it("纯追问只纠正一次：nudge 后登记 task_gaps → partial 交付", async () => {
     const taskId = seedTask();
     const { model, prompts } = makeFakeModel([
+      { toolCalls: [{ id: "call_s", name: "skill", input: {} }] },
       { text: "请确认合同类型？是运维服务还是人员外包？" }, // 纯追问 → nudge
       { toolCalls: [{ id: "call_w", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(PAPERS_WITH_GAP) } }] },
       { text: "已按共性规则核查，缺口登记完毕。" },
@@ -196,9 +199,9 @@ describe("runTask（模型替身 e2e，v0.6 单次提交）", () => {
 
     await runTask(depsFor(model), taskId);
 
-    // nudge 消息进入了第二次请求
-    expect(prompts).toHaveLength(3);
-    const nudgeMessage = JSON.stringify(prompts[1]!.messages);
+    // nudge 消息进入了追问后的那次请求
+    expect(prompts).toHaveLength(4);
+    const nudgeMessage = JSON.stringify(prompts[2]!.messages);
     expect(nudgeMessage).toContain("不与用户交互");
     expect(nudgeMessage).toContain("task_gaps");
 
@@ -232,5 +235,92 @@ describe("runTask（模型替身 e2e，v0.6 单次提交）", () => {
       .prepare("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type IN ('task_complete','task_failed')")
       .get(taskId) as { n: number };
     expect(events.n).toBe(1);
+  });
+});
+
+describe("P1-1 凭据闸门", () => {
+  it("skill 无法加载时，登记了实质发现也不能发布完整意见 → failed", async () => {
+    const taskId = seedTask("demo-skill@not-installed");
+    const { model } = makeFakeModel([
+      { toolCalls: [{ id: "call_1", name: "skill", input: {} }] }, // skill 工具返回错误
+      { toolCalls: [{ id: "call_2", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
+      { text: "完成。" },
+    ]);
+
+    await runTask(depsFor(model), taskId);
+
+    const task = db.getTask(taskId)!;
+    expect(task.status).toBe("failed");
+    expect(task.status_reason).toContain("skill");
+    const result = db.db.prepare("SELECT COUNT(*) AS n FROM results WHERE task_id = ?").get(taskId) as { n: number };
+    expect(result.n).toBe(0); // 未发布任何结果
+  });
+
+  it("材料存在但从未读取（无检索/回读成功）时，实质发现不能发布", async () => {
+    const taskId = seedTask();
+    const now = Date.now();
+    db.db
+      .prepare(
+        `INSERT INTO task_inputs (task_id, revision, seq, doc_id, version, role, label, origin_kind, origin_request)
+         VALUES (?, 1, 1, 'd_01', 1, '主合同', '主合同.docx', 'initial', NULL)`,
+      )
+      .run(taskId);
+    // docStatusCache 查询会失败（无 pipeline）→ 材料状态 unknown；readDocs 为空
+    const { model } = makeFakeModel([
+      { toolCalls: [{ id: "call_s", name: "skill", input: {} }] },
+      { toolCalls: [{ id: "call_w", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
+      { text: "完成。" },
+    ]);
+
+    await runTask(depsFor(model), taskId);
+
+    // write_file 阶段：有材料任务 + 实质发现 + 未引用读过文件 → 底稿写入被拒；
+    // 模型重试耗尽后结束，findings 依据不足 → failed（不发布）
+    const task = db.getTask(taskId)!;
+    expect(["failed", "completed"]).toContain(task.status);
+    if (task.status === "completed") {
+      // 若底稿整体被拒、papers 空 → no_valid_output → failed；此断言保护误发布路径
+      const row = db.db.prepare("SELECT review_outcome FROM results WHERE task_id = ?").get(taskId) as { review_outcome: string };
+      expect(row.review_outcome).not.toBe("complete");
+    }
+  });
+});
+
+describe("P1-6 v0.5 升级任务的恢复上下文", () => {
+  it("检查点修订落后时，已接纳文字作为既定事实进入首个模型请求", async () => {
+    const taskId = seedTask();
+    const now = Date.now();
+    db.db
+      .prepare(
+        `UPDATE tasks SET input_revision = 2 WHERE task_id = ?`,
+      )
+      .run(taskId);
+    // 旧检查点：修订 1 的消息（不含已接纳文字）
+    db.saveCheckpoint({
+      task_id: taskId,
+      batch: "run_old",
+      step_no: 1,
+      input_revision: 1,
+      messages: JSON.stringify([{ role: "user", content: "初次任务说明（修订1）" }]),
+      papers: JSON.stringify({ scope: null, items: [], task_gaps: [], conclusion_hint: null }),
+      evidence: null,
+      created_at: now - 1000,
+    });
+    // 修订 2 的已接纳文字
+    db.db
+      .prepare("INSERT INTO supplement_texts (task_id, revision, request_id, text, created_at) VALUES (?, 2, 'req_1', ?, ?)")
+      .run(taskId, "本次按驻场人天结算", now);
+
+    const { model, prompts } = makeFakeModel([
+      { toolCalls: [{ id: "call_s", name: "skill", input: {} }] },
+      { text: "结束。" },
+    ]);
+    await runTask(depsFor(model), taskId);
+
+    // 首个请求从已接纳事实重建：包含既定事实，且不含旧的待补问句
+    const first = JSON.stringify(prompts[0]!.messages);
+    expect(first).toContain("已确认的补充事实");
+    expect(first).toContain("按驻场人天结算");
+    expect(first).not.toContain("修订1");
   });
 });

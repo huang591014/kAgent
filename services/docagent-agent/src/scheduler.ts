@@ -93,10 +93,12 @@ export class Scheduler {
         }
       }
       if (anyReady || !anyProcessing || anyTimedOut) {
-        this.db.updateTask(task.task_id, { status: "queued" });
-        this.db.appendEvent(task.task_id, "progress", {
-          note: anyTimedOut && !anyReady ? "waiting_index 超时，按单份材料不可用交还审核" : "waiting_index 解除",
-        });
+        // P1-7a：条件更新——查询期间被取消/已终态的任务不被覆写
+        if (this.db.transitionTask(task.task_id, "waiting_index", "queued")) {
+          this.db.appendEvent(task.task_id, "progress", {
+            note: anyTimedOut && !anyReady ? "waiting_index 超时，按单份材料不可用交还审核" : "waiting_index 解除",
+          });
+        }
       }
     }
   }
@@ -111,27 +113,30 @@ export class Scheduler {
 
       const materials = this.db.latestMaterials(task.task_id);
       let anyReady = false;
-      let anyProcessing = false;
       const timeoutMs = config.waitingIndexTimeoutSeconds * 1000;
+      const waitingCandidates: Array<{ doc_id: string; version: number }> = [];
       for (const material of materials) {
         const snapshot = await this.statusOf(task, material.doc_id, material.version);
-        if (snapshot.ready) anyReady = true;
-        else if (PROCESSING_STATUSES.includes(snapshot.status)) anyProcessing = true;
-      }
-
-      if (materials.length > 0 && !anyReady && anyProcessing) {
-        // 仍在本修订的等待截止内 → 等待索引；已超时的版本不再等待（交还审核）
-        const timedOut = this.db.timedOutDocs(task.task_id, task.input_revision);
-        const stillWaiting = materials.some((m) => !timedOut.has(`${m.doc_id}@${m.version}`));
-        for (const material of materials) {
-          if (timedOut.has(`${material.doc_id}@${material.version}`)) continue;
-          this.db.getOrCreateWait(task.task_id, task.input_revision, material.doc_id, material.version, timeoutMs);
-        }
-        if (stillWaiting) {
-          this.db.updateTask(task.task_id, { status: "waiting_index" });
-          this.db.appendEvent(task.task_id, "progress", { note: "waiting_index" });
+        if (snapshot.ready) {
+          anyReady = true;
           continue;
         }
+        // P1-2b：只有「仍在处理」的版本才是等待候选；failed/needs_ocr/unknown/已超时
+        // 的版本一律退出等待集合，任务按可做内容收尾并说明原因
+        if (!PROCESSING_STATUSES.includes(snapshot.status)) continue;
+        if (this.db.timedOutDocs(task.task_id, task.input_revision).has(`${material.doc_id}@${material.version}`)) continue;
+        waitingCandidates.push(material);
+      }
+
+      if (materials.length > 0 && !anyReady && waitingCandidates.length > 0) {
+        for (const material of waitingCandidates) {
+          this.db.getOrCreateWait(task.task_id, task.input_revision, material.doc_id, material.version, timeoutMs);
+        }
+        // P1-7a：条件更新，避免覆写查询期间发生的取消/终态
+        if (this.db.transitionTask(task.task_id, "queued", "waiting_index")) {
+          this.db.appendEvent(task.task_id, "progress", { note: "waiting_index" });
+        }
+        continue;
       }
 
       // 派发：runTask 内 claimTask 原子领取（queued→running 条件更新），并发 tick 只有一个成功

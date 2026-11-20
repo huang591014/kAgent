@@ -105,7 +105,7 @@ export interface ToolContext {
   db: Db;
   task: TaskRow;
   materials: Array<{ doc_id: string; version: number; role: string; label: string }>;
-  identity: { tenant_id: string; user_id: string };
+  identity: { tenant_id: string; user_id: string; admin?: boolean };
   skills: SkillRegistry;
   retrieval: OpenSearchRetrieval;
   /** 每份材料的最新处理状态缓存（runner 在启动/恢复时刷新） */
@@ -114,6 +114,9 @@ export interface ToolContext {
   papers: PapersDoc;
   /** 运行时保存的活动范围（B1）；写底稿时核对，路由变化需 scope_change_reason */
   activeScope: ActiveScope | null;
+  /** 运行时凭据（P1-1）：skill 成功加载过、实际成功读到过的材料版本。
+   * 恢复执行时从检查点重建，发布前据此拒绝依据不足的实质意见。 */
+  evidence: { skillLoaded: boolean; readDocs: Set<string> };
 }
 
 export interface ToolOutcome {
@@ -162,6 +165,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, c
 
 function runSkill(ctx: ToolContext) {
   const body = ctx.skills.bodyFor(ctx.task.skill_ref);
+  ctx.evidence.skillLoaded = true; // P1-1：成功加载计入运行时凭据
   return {
     skill_ref: ctx.task.skill_ref,
     base_directory: body.baseDirectory,
@@ -211,11 +215,34 @@ function runWriteFile(filePath: string, content: string, ctx: ToolContext): Tool
     } catch (error) {
       return err(`底稿不是合法 JSON：${(error as Error).message}。上一份有效快照已保留，请修正后重写。`);
     }
-    const validation = validatePapers(parsed, ctx.materials, ctx.activeScope);
+    const validation = validatePapers(parsed, ctx.materials, ctx.activeScope, ctx.papers.task_gaps ?? []);
     if (!validation.ok) {
       return err({
         message: "底稿校验失败，未写入；上一份有效快照已保留。",
         errors: validation.errors,
+      });
+    }
+    // P1-1：凭据校验——引用的文件版本必须实际成功读过；有材料时实质发现必须引用读过文件
+    const evidenceErrors: string[] = [];
+    for (const item of validation.papers.items) {
+      if (item.status !== "checked") continue;
+      for (const ref of item.used_materials) {
+        if (!ctx.evidence.readDocs.has(`${ref.doc_id}@${ref.version}`)) {
+          evidenceErrors.push(
+            `${item.item_id} 引用了未实际读取的材料版本 ${ref.doc_id}@${ref.version}：先用 doc_search / doc_read / doc_outline 读取后再引用。`,
+          );
+        }
+      }
+      if (item.finding && item.used_materials.length === 0 && ctx.materials.length > 0) {
+        evidenceErrors.push(
+          `${item.item_id} 登记了实质发现但未引用任何材料版本：依赖合同内容的结论必须把实际读过的文件记入 used_materials。`,
+        );
+      }
+    }
+    if (evidenceErrors.length > 0) {
+      return err({
+        message: "底稿凭据校验失败，未写入；上一份有效快照已保留。",
+        errors: evidenceErrors,
       });
     }
     // 首次确定路径或路由变化：把范围独立保存到运行时存储（分母不随底稿文件漂移）
@@ -285,6 +312,7 @@ async function runDocOutline(docId: string, version: number | undefined, ctx: To
   );
   if (!target) throw new Error(`材料不在当前输入修订：${docId}`);
   const outline = await pipeline.outline(ctx.identity, docId, target.version);
+  ctx.evidence.readDocs.add(`${docId}@${target.version}`); // P1-1：目录读取成功即证据
   // 目录项裁剪，避免过长
   return {
     doc_id: docId,
@@ -305,6 +333,9 @@ async function runDocSearch(args: Record<string, unknown>, ctx: ToolContext) {
     docIds: Array.isArray(args.doc_ids) ? (args.doc_ids as string[]) : undefined,
     topK: args.top_k ? Number(args.top_k) : 10,
   });
+  for (const hit of outcome.hits) {
+    ctx.evidence.readDocs.add(`${hit.doc_id}@${hit.version}`); // P1-1：检索命中即读取证据
+  }
   return {
     total: outcome.total,
     hits: outcome.hits.map((h) => {
@@ -335,6 +366,7 @@ async function runDocRead(args: Record<string, unknown>, ctx: ToolContext) {
   });
   const key = `${docId}@${version ?? ctx.materials.find((m) => m.doc_id === docId)?.version ?? 0}`;
   const cached = ctx.docStatusCache.get(key);
+  ctx.evidence.readDocs.add(key); // P1-1：实际回读成功
   return {
     blocks: result.blocks,
     next_cursor: result.next_cursor,

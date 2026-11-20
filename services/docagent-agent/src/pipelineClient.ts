@@ -37,7 +37,7 @@ export interface PipelineError extends Error {
 async function call<T>(
   method: string,
   path: string,
-  identity: { tenant_id: string; user_id: string },
+  identity: { tenant_id: string; user_id: string; admin?: boolean },
   init?: { body?: unknown },
 ): Promise<T> {
   const url = `${config.pipelineBaseUrl}${path}`;
@@ -49,6 +49,8 @@ async function call<T>(
         "x-internal-key": config.internalServiceKey,
         "x-tenant-id": identity.tenant_id,
         "x-user-id": identity.user_id,
+        // 管理员代查：pipeline 对 internal 调用信任该头，按管理范围放行
+        ...(identity.admin ? { "x-admin": "1" } : {}),
         ...(init?.body !== undefined ? { "content-type": "application/json" } : {}),
       },
       body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
@@ -74,13 +76,13 @@ async function call<T>(
 }
 
 export const pipeline = {
-  docStatus(identity: { tenant_id: string; user_id: string }, docId: string, version?: number): Promise<DocVersionStatus> {
+  docStatus(identity: { tenant_id: string; user_id: string; admin?: boolean }, docId: string, version?: number): Promise<DocVersionStatus> {
     const query = version !== undefined ? `?version=${version}` : "";
     return call<DocVersionStatus>("GET", `/api/v1/docs/${docId}${query}`, identity);
   },
 
   outline(
-    identity: { tenant_id: string; user_id: string },
+    identity: { tenant_id: string; user_id: string; admin?: boolean },
     docId: string,
     version: number,
   ): Promise<{ doc_id: string; version: number; filename: string | null; block_count: number; first_block_id: string | null; items: OutlineItem[] }> {
@@ -88,7 +90,7 @@ export const pipeline = {
   },
 
   blocks(
-    identity: { tenant_id: string; user_id: string },
+    identity: { tenant_id: string; user_id: string; admin?: boolean },
     docId: string,
     version: number,
     after: number,
@@ -112,7 +114,7 @@ export const pipeline = {
   },
 
   block(
-    identity: { tenant_id: string; user_id: string },
+    identity: { tenant_id: string; user_id: string; admin?: boolean },
     docId: string,
     version: number,
     blockId: string,

@@ -29,13 +29,15 @@ def resolve_identity(
 ) -> Identity:
     if x_internal_key and x_internal_key == settings.internal_service_key:
         # agent 服务内部调用：服务密钥只证明调用方是 agent；
-        # 被代理身份（x-user-id，即任务属主）仍按普通用户口径做材料属主校验（D1）。
+        # 被代理身份（x-user-id，即任务属主）仍按属主/管理范围校验（D1）。
+        # 管理员代查：agent 在创建任务时记录了提交者是否管理员，internal 调用
+        # 可信转发 x-admin 头，按管理范围（M1：本租户）放行。
         if not x_tenant_id or not x_user_id:
             raise HTTPException(status_code=401, detail="internal call missing proxied tenant/user headers")
         return Identity(
             tenant_id=x_tenant_id,
             user_id=x_user_id,
-            is_admin=False,
+            is_admin=x_admin in ("1", "true", "yes"),
             is_internal=True,
         )
     if not x_tenant_id or not x_user_id:

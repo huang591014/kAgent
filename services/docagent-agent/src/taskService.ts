@@ -56,7 +56,7 @@ function canonicalCreateInput(input: CreateTaskInput): string {
 export const taskService = {
   async createTask(
     deps: { db: Db; skills: SkillRegistry },
-    identity: { tenant_id: string; user_id: string },
+    identity: { tenant_id: string; user_id: string; admin?: boolean },
     input: CreateTaskInput,
   ): Promise<{ task_id: string; status: string; inputs: Array<{ doc_id: string; version: number; role: string; label: string }> }> {
     const { db, skills } = deps;
@@ -122,13 +122,14 @@ export const taskService = {
       }
       db.db
         .prepare(
-          `INSERT INTO tasks (task_id, tenant_id, submitted_by, scenario, skill_ref, config_snapshot, status, input_revision, current_batch, input_closed, usage, status_reason, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, NULL, 1, '{}', NULL, ?, ?)`,
+          `INSERT INTO tasks (task_id, tenant_id, submitted_by, is_admin, scenario, skill_ref, config_snapshot, status, input_revision, current_batch, input_closed, usage, status_reason, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 1, NULL, 1, '{}', NULL, ?, ?)`,
         )
         .run(
           taskId,
           identity.tenant_id,
           identity.user_id,
+          identity.admin ? 1 : 0,
           input.scenario ?? "",
           skillRef,
           JSON.stringify({ model: config.modelName, temperature: config.modelTemperature }),
@@ -171,19 +172,15 @@ export const taskService = {
     if (["completed", "failed", "cancelled"].includes(task.status)) {
       return { task_id: taskId, status: task.status };
     }
-    const controller = activeRuns.get(taskId);
-    if (controller) {
-      controller.abort(); // runner 捕获后落终态
-      return { task_id: taskId, status: "cancelling" };
-    }
-    // 条件更新：仅非终态可取消，迟到回调不能改写终态
-    const info = db.db
-      .prepare("UPDATE tasks SET status = 'cancelled', status_reason = '用户取消', updated_at = ? WHERE task_id = ? AND status NOT IN ('completed','failed','cancelled')")
-      .run(Date.now(), taskId);
-    if (Number(info.changes) === 0) {
+    // P1-7b：先以数据库条件更新确定取消与发布谁先成功——取消获胜后执行中的
+    // 发布事务会看到非 running 状态而拒绝发布；然后才中止执行句柄。
+    const cancelled = db.transitionTask(taskId, task.status, "cancelled", { status_reason: "用户取消" });
+    if (!cancelled) {
       return { task_id: taskId, status: db.getTask(taskId)?.status ?? "unknown" };
     }
     db.appendEvent(taskId, "task_cancelled", {});
+    const controller = activeRuns.get(taskId);
+    if (controller) controller.abort(); // runner 捕获后按已取消状态收尾
     return { task_id: taskId, status: "cancelled" };
   },
 };

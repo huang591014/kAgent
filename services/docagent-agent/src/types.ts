@@ -103,7 +103,10 @@ export interface PapersScope {
   expected_item_ids: string[];
 }
 
-/** 任务级缺口（v0.6 §4）：可落在整个任务（如专项路径待确定），随底稿持久化恢复。 */
+/** 任务级缺口（v0.6 §4）：可落在整个任务（如专项路径待确定），随底稿持久化恢复。
+ * 已登记的缺口按 gap_id 跟踪至明确解决：解决时保留记录并置 resolved=true，
+ * 整份写入省略该 id 会被校验拒绝（区分解决与漏写）。
+ */
 export interface TaskGap {
   gap_id: string;
   category: "missing_material" | "missing_fact" | "file_issue" | "route_undetermined" | "budget";
@@ -111,6 +114,9 @@ export interface TaskGap {
   statement: string;
   /** 对覆盖的影响 */
   impact: string;
+  /** 显式解决标记；resolved 的缺口不参与覆盖判定与正文 */
+  resolved?: boolean;
+  resolved_reason?: string;
   /** 已提交文件出现问题时记录；从未提交的材料只写 missing_role，不虚构文件标识 */
   doc_id?: string;
   version?: number;

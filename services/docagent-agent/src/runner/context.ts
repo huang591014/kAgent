@@ -68,30 +68,49 @@ export function fitMessagesToBudget(
     if (changed) message.content = next;
   });
 
-  // 2) 头部丢弃：超出预算时，从最早的可丢弃 user 边界开始逐段丢弃
+  // 2) 头部裁剪（P1-9）：单次提交通常只有首条 user，之后全是 assistant/tool 往返。
+  //    按「工具组」成组丢弃：assistant(带 toolCalls) + 其后连续的 tool 消息为一组，
+  //    整组删除不破坏调用-回执配对；保留首条 user（任务输入）与最新进度，
+  //    丢弃点插入一条省略标记。早期底稿写入等长往返被替换为该引用。
   let dropped = 0;
   const budget = opts.budget ?? config.budgetHistory;
   const total = messages.reduce((sum, m) => sum + messageTokens(m), 0);
   if (total > budget) {
     const firstUser = messages.findIndex((m) => m.role === "user");
     const safeStart = firstUser === -1 ? 0 : firstUser + 1;
-    // 候选切点：safeStart 之后的每条 user 消息（切点保留其后全部）
-    const boundaries: number[] = [];
-    for (let i = safeStart; i < messages.length; i++) {
-      if (messages[i]!.role === "user") boundaries.push(i);
+    // 分组：从 safeStart 起把消息切成 [组...]；组 = 一条 assistant + 紧随的 tool（若有），
+    // 或单条无工具 assistant / user
+    const groups: Array<{ start: number; end: number }> = [];
+    let i = safeStart;
+    while (i < messages.length) {
+      const message = messages[i]!;
+      if (message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0) {
+        let end = i + 1;
+        while (end < messages.length && messages[end]!.role === "tool") end += 1;
+        groups.push({ start: i, end });
+        i = end;
+      } else {
+        groups.push({ start: i, end: i + 1 });
+        i += 1;
+      }
     }
-    let cut = -1;
+    // 从最旧的组开始丢，直到满足预算或只剩最后一组
     let acc = total;
-    for (const boundary of boundaries) {
-      const saved = messages.slice(safeStart, boundary).reduce((sum, m) => sum + messageTokens(m), 0);
-      acc -= saved;
-      cut = boundary;
+    let dropUpto = safeStart; // 丢弃 [safeStart, dropUpto)
+    for (const group of groups) {
+      if (group.end >= messages.length) break; // 至少保留最后一组
+      acc -= messages.slice(group.start, group.end).reduce((sum, m) => sum + messageTokens(m), 0);
+      dropUpto = group.end;
       if (acc <= budget) break;
     }
-    if (cut > safeStart) {
-      dropped = cut - safeStart;
-      const kept = messages.slice(cut);
-      kept.unshift({ role: "user", content: "[更早的对话因长度策略已省略；关键事实请以 working-papers.json 为准]" });
+    if (dropUpto > safeStart) {
+      dropped = dropUpto - safeStart;
+      const kept = messages.slice(0, safeStart).concat(messages.slice(dropUpto));
+      kept.splice(safeStart, 0, {
+        role: "user",
+        content:
+          "[更早的工具往返因长度策略已省略（底稿写入等）；关键事实与进度以 working-papers.json 为准，需要原文请用检索工具重新读取]",
+      });
       return { messages: kept, dropped, truncatedToolResults: truncated };
     }
   }

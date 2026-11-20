@@ -34,6 +34,7 @@ export function validatePapers(
   input: unknown,
   revisionMaterials: readonly RevisionMaterialRef[],
   activeScope: ActiveScope | null = null,
+  previousTaskGaps: readonly TaskGap[] = [],
 ): PapersValidation {
   const errors: string[] = [];
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -65,25 +66,30 @@ export function validatePapers(
     }
   }
 
-  // 与运行时保存的活动范围核对：同一路由下不允许改动分母；路由变化需要理由。
+  // 与运行时保存的活动范围核对：按规则卡身份识别路由——
+  // 同一张卡不允许删减已登记的预期项（即使附理由）；规则卡变化才是路由变化，需要材料依据。
   let scopeChanged = false;
   const scopeChangeReason = optionalString(raw.scope_change_reason);
   if (activeScope) {
     if (!scope) {
       errors.push("已确定审核路径后不能清空 scope；如需调整请说明 scope_change_reason 并登记新范围");
     } else {
-      const sameRoute =
-        arraysEqual(scope.rule_cards, activeScope.rule_cards) &&
-        arraysEqual(scope.expected_item_ids, activeScope.expected_item_ids);
-      if (!sameRoute) {
-        if (!scopeChangeReason) {
+      const sameCards = arraysEqual(scope.rule_cards, activeScope.rule_cards);
+      if (sameCards) {
+        const removed = activeScope.expected_item_ids.filter((id) => !scope.expected_item_ids.includes(id));
+        if (removed.length > 0) {
           errors.push(
-            `预期检查项范围与已登记的不一致（已登记：${activeScope.expected_item_ids.join("、")}，原因：${activeScope.reason}）。` +
-              "确属路由变化时必须填写 scope_change_reason 说明依据，并登记新规则卡的完整预期项。",
+            `同一张规则卡不允许删减已登记的预期检查项（被删除：${removed.join("、")}）。` +
+              "该项应更新为对应状态（checked/pending/not_applicable），或作为路由变化登记新的规则卡并说明依据。",
           );
-        } else {
-          scopeChanged = true;
         }
+      } else if (!scopeChangeReason) {
+        errors.push(
+          `规则卡与已登记的不一致（已登记：${activeScope.rule_cards.join("、")}，原因：${activeScope.reason}）。` +
+            "确属路由变化时必须填写 scope_change_reason 说明从材料取得的依据，并登记新规则卡的完整预期项。",
+        );
+      } else {
+        scopeChanged = true;
       }
     }
   }
@@ -243,16 +249,34 @@ export function validatePapers(
           errors.push(`task_gaps ${gapId} 引用了当前修订之外的材料版本：${docId}@${version}`);
           continue;
         }
+        const resolved = g.resolved === true;
+        const resolvedReason = optionalString(g.resolved_reason);
+        if (resolved && !resolvedReason) {
+          errors.push(`task_gaps ${gapId} 标记 resolved 时必须填写 resolved_reason（如何解决的）`);
+        }
         taskGaps.push({
           gap_id: gapId,
           category,
           statement: statement ?? "",
           impact: impact ?? "",
+          ...(resolved ? { resolved: true } : {}),
+          ...(resolvedReason ? { resolved_reason: resolvedReason } : {}),
           ...(docId ? { doc_id: docId } : {}),
           ...(version !== undefined ? { version } : {}),
           ...(optionalString(g.label) ? { label: optionalString(g.label)! } : {}),
           ...(optionalString(g.missing_role) ? { missing_role: optionalString(g.missing_role)! } : {}),
         });
+      }
+      // 缺口按 gap_id 跟踪至明确解决：已登记的缺口不能静默消失，解决须显式 resolved
+      for (const previous of previousTaskGaps) {
+        if (previous.resolved) continue;
+        const stillPresent = taskGaps.some((g) => g.gap_id === previous.gap_id);
+        if (!stillPresent) {
+          errors.push(
+            `已登记的任务级缺口 ${previous.gap_id}（${previous.statement}）在本次写入中消失。` +
+              "解决缺口必须保留记录并显式标记 resolved=true 及 resolved_reason，不能直接省略。",
+          );
+        }
       }
     }
   }
@@ -340,7 +364,7 @@ export function coverageStats(papers: PapersDoc): CoverageStats {
     notApplicable: na.length,
     findings: checked.filter((i) => i.finding !== null).length,
     applicable: Math.max(0, expected - na.length),
-    openTaskGaps: papers.task_gaps ?? [],
+    openTaskGaps: (papers.task_gaps ?? []).filter((g) => g.resolved !== true),
   };
 }
 

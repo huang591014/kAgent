@@ -11,7 +11,7 @@ flowchart TD
     P --> W[解析与索引 worker]
     W --> O[(OpenSearch 元数据与文本块)]
     U -->|提交任务 / 回应补充请求 / 查询结果| A[doc-agent Task API]
-    A --> T[(SQLite 任务状态 / 待补请求 / 底稿)]
+    A --> T[(SQLite 任务状态 / 检查点 / 底稿)]
     A --> K[版本化 skill 包]
     A --> L[内网文本模型 OpenAI 兼容]
     A --> R[进程内 doc-retrieval]
@@ -19,8 +19,8 @@ flowchart TD
 ```
 
 - **doc-pipeline**（Python 3.12+）：原件登记、PDF/DOCX 解析（pdfplumber / python-docx）、按条款边界切块（约 800 token）、OpenSearch 索引发布、版本管理与失败重试。
-- **doc-agent**（Node 22+，TypeScript）：任务状态机（queued / waiting_index / running / waiting_for_input / completed / failed / cancelled）、skill 加载（目录或 ZIP、内容摘要版本化、路径约束）、模型与工具循环（Vercel AI SDK + OpenAI 兼容端点）、working-papers 底稿校验、待补请求（3 张上限）、补件接纳协议（幂等 / 409 / 原子事务）、覆盖判定与运行时成文、检查点与重启恢复。
-- **前端**：单页静态页（提交任务 / 任务详情轮询 / 待补卡 / Markdown 结果渲染）。
+- **doc-agent**（Node 22+，TypeScript）：任务状态机（queued / waiting_index / running / completed / failed / cancelled）、skill 加载（目录或 ZIP、内容摘要版本化、路径约束）、模型与工具循环（Vercel AI SDK + OpenAI 兼容端点）、working-papers 底稿校验与运行时凭据（skill 成功加载/材料实际读过才能发布实质意见）、task_gaps 任务级缺口、覆盖判定与运行时成文、检查点与重启恢复、原子领取与条件状态转移。
+- **前端**：单页静态页（提交任务 / 任务详情轮询 / Markdown 结果渲染与净化降级）。
 
 ## 目录结构
 
@@ -43,7 +43,7 @@ flowchart TD
 │       │   ├── skills/         # skill 包加载与注册表
 │       │   ├── papers.ts       # working-papers 校验与覆盖统计
 │       │   ├── outcome.ts      # review_outcome 判定与成文
-│       │   ├── taskService.ts  # 创建 / 补件接纳 / 取消
+│       │   ├── taskService.ts  # 创建（幂等）/ 取消
 │       │   ├── scheduler.ts    # 并发上限、waiting_index 轮询、重启恢复
 │       │   └── httpApi.ts      # 任务 API + SSE + 静态前端
 │       ├── test/               # vitest
@@ -80,7 +80,7 @@ npm start                        # 监听 :8001，启动时扫描安装 var/skil
 open http://localhost:8001/
 ```
 
-模型端点必须可达（`MODEL_BASE_URL`，OpenAI 兼容，如内网 vLLM/SGLang 的 Qwen3.8-27B）。没有模型时任务会以执行失败终态返回原因；文档入库、检索、任务 API 与待补状态机均可独立验证。
+模型端点必须可达（`MODEL_BASE_URL`，OpenAI 兼容端点）。没有模型时任务会以执行失败终态返回原因；文档入库、检索与任务 API 均可独立验证。
 
 ### 冒烟自检
 
@@ -101,7 +101,6 @@ curl -s -X POST localhost:8001/api/tasks -H 'content-type: application/json' \
 | `MODEL_BASE_URL` / `MODEL_NAME` | 内网 OpenAI 兼容端点与模型名 |
 | `AGENT_SKILLS_DIR` / `AGENT_DATA_DIR` | skill 包根 / 任务库持久卷（相对路径锚定仓库根） |
 | `MAX_RUNNING_TASKS` / `MAX_STEPS` / `MAX_TASK_TOKENS` | 并发与预算（设计 §4.4：初始运行上限 4） |
-| `REQUEST_INPUT_LIMIT` | 每任务待补卡上限（默认 3） |
 | `WAITING_INDEX_TIMEOUT_SECONDS` | 等待索引超时（超时按单份材料不可用处理） |
 
 ## API 摘要（agent :8001）
@@ -109,7 +108,7 @@ curl -s -X POST localhost:8001/api/tasks -H 'content-type: application/json' \
 | 调用 | 行为 |
 |---|---|
 | `POST /api/tasks` | `scenario, skill, docs[], idempotency_key?` → 任务与实际绑定版本 |
-| `GET /api/tasks/{id}` | 状态、输入修订、进度、材料问题；待补时返回 `pending_input` |
+| `GET /api/tasks/{id}` | 状态、输入修订、进度、材料问题（单次提交流程，无待补卡） |
 | `POST /api/tasks/{id}/input` | **已下线（v0.6）**：返回 `410` 与刷新提示，不产生写操作 |
 | `GET /api/tasks/{id}/result` | `completed` 后返回 `conclusion_md` 等结果；执行中 202 |
 | `GET /api/tasks/{id}/events` | SSE（可选，前端也可仅轮询） |
@@ -138,7 +137,7 @@ cd services/docagent-pipeline && .venv/Scripts/python -m pytest tests/ -q
 - **insufficient/failed 判据收紧**（v0.6 §4）：零已核时只有“可明确指出的材料/事实缺口”才交付 `insufficient_materials`；空底稿、普通“待执行”、状态查询失败不能推出用户缺材料，交由运行时按 `failed` 收尾（无 `review_outcome`）。无关附件失败不影响 complete 交付，但正文必须列【材料处理说明】。
 - **历史任务迁移**：启动时旧 `waiting_for_input` 任务在同一事务内关闭待补卡、按最后已接纳输入转 `queued`（幂等，记 `migrated_to_single_submission` 事件）；新任务从首个输入版本起 `input_closed=1`。幂等创建增强：同键同内容（含并发）返回同一任务，同键不同内容 409。
 - **预期审查范围由运行时独立保存**（`task_scopes` 表，按任务 × 输入修订）：底稿内同步删改 expected 或删除待核项会被写入校验拒绝；路由确需变化必须携带 `scope_change_reason` 并重登记完整范围；统计与成文的分母始终取保存范围，底稿缺失项按待核兜底。
-- 模型消息以 AI SDK `ModelMessage` 为边界往返：assistant 的工具调用是 content 内 `tool-call` 块，tool 结果按原 ID 配对且包装为 `json / text / error-text`；待补暂停时同组未执行调用有明确跳过回执。
+- 模型消息以 AI SDK `ModelMessage` 为边界往返：assistant 的工具调用是 content 内 `tool-call` 块，tool 结果按原 ID 配对且包装为 `json / text / error-text`。
 - 执行领取以 `claimTask`（`status=queued` 条件更新）原子完成，定时 tick 与 kick 重叠时同一任务只有一个执行批次；批次贯穿检查点与结果发布，发布前校验批次、输入修订与状态。
 - 等待索引的起点与截止持久化（`index_waits`，任务 × 修订 × 版本），超时把该版本记为不可用并交还审核逻辑（带原因进入 `material_issues`），重启沿用截止时间。
 - 材料引用粒度为文件级（`doc_id + version`）；逐条定位与可点击引用留作后续增强。

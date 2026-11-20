@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Db } from "../src/db.js";
-import { enforceActiveScope, validatePapers } from "../src/papers.js";
+import { coverageStats, enforceActiveScope, validatePapers } from "../src/papers.js";
 import { composeConclusion, determineOutcome } from "../src/outcome.js";
 
 let baseDir: string;
@@ -71,7 +71,7 @@ describe("B1 活动范围固定", () => {
       db.getActiveScope("t1", 1),
     );
     expect(shrunk.ok).toBe(false);
-    if (!shrunk.ok) expect(shrunk.errors.join()).toContain("不一致");
+    if (!shrunk.ok) expect(shrunk.errors.join()).toContain("不允许删减");
 
     // 同路由下缺项写入也被拒绝（items 缺 b）
     const missing = validatePapers(
@@ -198,6 +198,95 @@ describe("v0.6 任务级缺口与无效产出判定", () => {
     expect(
       validatePapers(base([{ gap_id: "g1", category: "file_issue", statement: "x", impact: "y", doc_id: "d_99", version: 9 }]), materials, null).ok,
     ).toBe(false);
+  });
+});
+
+describe("P1-5 全不适用与缺口并存", () => {
+  it("全不适用 + 专项待确定 → partial/insufficient，正文不丢缺口，不用「均不适用」结论", () => {
+    const papers = {
+      scope: { rule_cards: ["C1 共性"], expected_item_ids: ["a"] },
+      conclusion_hint: null,
+      task_gaps: [
+        { gap_id: "g1", category: "route_undetermined" as const, statement: "运维/外包无法判定", impact: "专项卡未执行" },
+      ],
+      items: [item({ item_id: "a", status: "not_applicable", not_applicable_reason: "共性项不涉密" })],
+    };
+    const outcome = determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] });
+    expect(outcome).toBe("partial"); // 0 已核 + 事实缺口本可 insufficient，但有 not_applicable 记录时按 partial 展示缺口
+    const composed = composeConclusion({ papers, outcome: "partial", ctx: { revisionMaterials: materials, materialIssues: [] } });
+    expect(composed.conclusion_md).toContain("专项规则待确定");
+    expect(composed.conclusion_md).not.toContain("本次规则均不适用");
+  });
+
+  it("conclusion_hint=拟同意 与 partial 不相容 → 首句用运行时口径", () => {
+    const papers = {
+      scope: { rule_cards: ["C1"], expected_item_ids: ["a", "b"] },
+      conclusion_hint: "拟同意",
+      task_gaps: [],
+      items: [
+        item(),
+        item({ item_id: "b", status: "pending", finding: null, pending_reason: "缺采购纪要", missing_role: "纪要" }),
+      ],
+    };
+    const composed = composeConclusion({ papers, outcome: "partial", ctx: { revisionMaterials: materials, materialIssues: [] } });
+    expect(composed.conclusion_md.split("
+")[0]).not.toContain("拟同意");
+    expect(composed.conclusion_md).toContain("请补充材料");
+  });
+
+  it("P1-4：同卡附理由删项被拒；漏写已登记缺口被拒；显式 resolved 放行", () => {
+    // 同卡 + scope_change_reason + 删项 → 拒绝（路由未变只是删分母）
+    db.saveActiveScope("t1", 1, { rule_cards: ["C1"], expected_item_ids: ["a", "b"], reason: "initial" });
+    const shrunkWithReason = validatePapers(
+      {
+        scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
+        scope_change_reason: "想缩小范围",
+        conclusion_hint: null,
+        task_gaps: [],
+        items: [item()],
+      },
+      materials,
+      db.getActiveScope("t1", 1),
+    );
+    expect(shrunkWithReason.ok).toBe(false);
+    if (!shrunkWithReason.ok) expect(shrunkWithReason.errors.join()).toContain("不允许删减");
+
+    // 漏写已登记缺口 → 拒绝
+    const previousGaps = [
+      { gap_id: "g1", category: "route_undetermined" as const, statement: "专项待定", impact: "x" },
+    ];
+    const dropped = validatePapers(
+      {
+        scope: { rule_cards: ["C1"], expected_item_ids: ["a", "b"] },
+        conclusion_hint: null,
+        task_gaps: [],
+        items: [item(), item({ item_id: "b", status: "pending", finding: null, pending_reason: "待执行" })],
+      },
+      materials,
+      db.getActiveScope("t1", 1),
+      previousGaps,
+    );
+    expect(dropped.ok).toBe(false);
+    if (!dropped.ok) expect(dropped.errors.join()).toContain("消失");
+
+    // 显式 resolved 放行，且 resolved 缺口不参与覆盖判定
+    const resolved = validatePapers(
+      {
+        scope: { rule_cards: ["C1"], expected_item_ids: ["a", "b"] },
+        conclusion_hint: null,
+        task_gaps: [
+          { gap_id: "g1", category: "route_undetermined", statement: "专项待定", impact: "x", resolved: true, resolved_reason: "用户已提供采购纪要，路由确定为运维" },
+        ],
+        items: [item(), item({ item_id: "b" })],
+      },
+      materials,
+      db.getActiveScope("t1", 1),
+      previousGaps,
+    );
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) {
+      expect(coverageStats(resolved.papers).openTaskGaps).toHaveLength(0);
+    }
   });
 });
 

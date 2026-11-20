@@ -14,6 +14,7 @@ export interface TaskRow {
   task_id: string;
   tenant_id: string;
   submitted_by: string;
+  is_admin: number;
   scenario: string;
   skill_ref: string;
   config_snapshot: string; // JSON
@@ -46,6 +47,7 @@ export interface CheckpointRow {
   input_revision: number;
   messages: string; // JSON StoredMessage[]
   papers: string; // JSON PapersDoc
+  evidence: string | null; // JSON { skillLoaded, readDocs[] }（P1-1 运行时凭据）
   created_at: number;
 }
 
@@ -66,6 +68,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   submitted_by TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0,
   scenario TEXT NOT NULL DEFAULT '',
   skill_ref TEXT NOT NULL,
   config_snapshot TEXT NOT NULL DEFAULT '{}',
@@ -150,6 +153,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   input_revision INTEGER NOT NULL,
   messages TEXT NOT NULL,
   papers TEXT NOT NULL,
+  evidence TEXT,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (task_id, batch, step_no)
 );
@@ -226,6 +230,18 @@ export class Db {
     if (!idemColumns.includes("payload_hash")) {
       this.db.exec("ALTER TABLE idempotency ADD COLUMN payload_hash TEXT");
     }
+    const taskColumns = (
+      this.db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    if (!taskColumns.includes("is_admin")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0");
+    }
+    const ckptColumns = (
+      this.db.prepare("PRAGMA table_info(checkpoints)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    if (!ckptColumns.includes("evidence")) {
+      this.db.exec("ALTER TABLE checkpoints ADD COLUMN evidence TEXT");
+    }
     this.migrateToSingleSubmission();
   }
 
@@ -262,6 +278,17 @@ export class Db {
       .run(batch, Date.now(), taskId);
     if (Number(info.changes) === 0) return { claimed: false };
     return { claimed: true, task: this.getTask(taskId) };
+  }
+
+  /** 条件状态转移（P1-7）：仅当仍处于 from 状态时才更新；迟到回调不能改写终态。 */
+  transitionTask(taskId: string, from: string, to: string, patch: Partial<TaskRow> = {}): boolean {
+    const keys = Object.keys(patch);
+    const sets = keys.length > 0 ? `, ${keys.map((k) => `${k} = ?`).join(", ")}` : "";
+    const values = keys.map((k) => (patch as Record<string, unknown>)[k]) as never[];
+    const info = this.db
+      .prepare(`UPDATE tasks SET status = ?, updated_at = ?${sets} WHERE task_id = ? AND status = ?`)
+      .run(to, Date.now(), ...values, taskId, from);
+    return Number(info.changes) > 0;
   }
 
   close(): void {
@@ -401,16 +428,23 @@ export class Db {
   saveCheckpoint(row: CheckpointRow): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO checkpoints (task_id, batch, step_no, input_revision, messages, papers, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO checkpoints (task_id, batch, step_no, input_revision, messages, papers, evidence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(row.task_id, row.batch, row.step_no, row.input_revision, row.messages, row.papers, row.created_at);
+      .run(row.task_id, row.batch, row.step_no, row.input_revision, row.messages, row.papers, row.evidence ?? null, row.created_at);
   }
 
   latestCheckpoint(taskId: string): CheckpointRow | undefined {
     return this.db
       .prepare("SELECT * FROM checkpoints WHERE task_id = ? ORDER BY created_at DESC, step_no DESC LIMIT 1")
       .get(taskId) as CheckpointRow | undefined;
+  }
+
+  /** 已接纳的补充文字（按修订序，≤ maxRevision）——v0.5 升级任务恢复上下文用（P1-6）。 */
+  listSupplementTexts(taskId: string, maxRevision: number): Array<{ revision: number; request_id: string; text: string }> {
+    return this.db
+      .prepare("SELECT revision, request_id, text FROM supplement_texts WHERE task_id = ? AND revision <= ? ORDER BY revision ASC")
+      .all(taskId, maxRevision) as Array<{ revision: number; request_id: string; text: string }>;
   }
 
   // ===== events =====

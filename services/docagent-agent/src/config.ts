@@ -79,7 +79,6 @@ export const config = {
   maxSteps: int("MAX_STEPS", 48),
   maxTaskWallMinutes: int("MAX_TASK_WALL_MINUTES", 40),
   maxTaskTokens: int("MAX_TASK_TOKENS", 2_000_000),
-  requestInputLimit: int("REQUEST_INPUT_LIMIT", 3),
   waitingIndexTimeoutSeconds: int("WAITING_INDEX_TIMEOUT_SECONDS", 900),
 
   // 上下文分配（token）：系统与清单 6k、历史 90k、本步工具结果 20k、输出预留 8k

@@ -20,16 +20,10 @@ export interface OutcomeContext {
 /** 内部判定值：无可交付审核结果且无已证实的材料/事实缺口 → 交由运行时按 failed 处理。 */
 export type DeterminedOutcome = ReviewOutcome | "no_valid_output";
 
-/** 占位式“待执行”不构成缺材料证明（v0.6 §4：普通“待执行”不能推出用户缺材料）。 */
-const PLACEHOLDER_REASONS = new Set(["待执行", "待处理", "todo", "pending", "未执行", "未开始"]);
-
-function isSubstantivePendingReason(reason: string | null): boolean {
-  if (!reason) return false;
-  const normalized = reason.trim().toLowerCase();
-  if (PLACEHOLDER_REASONS.has(normalized)) return false;
-  return /(缺|未|无法|失败|超时|不明|待确定|未确定|读取|索引)/.test(reason) || reason.trim().length >= 8;
-}
-
+/** insufficient 的证据必须是**结构性**的（v0.6 §4）：
+ * 任务级缺口（非预算类）或指向具体材料用途的待核项（missing_role）。
+ * 不再从 pending_reason 文本推断——技术性原因（预算/模型/存储/索引故障）与占位“待执行”
+ * 一律不能推出用户缺材料。 */
 export function determineOutcome(papers: PapersDoc, ctx: OutcomeContext): DeterminedOutcome {
   const stats = coverageStats(papers);
   const openGaps = stats.openTaskGaps;
@@ -51,12 +45,10 @@ export function determineOutcome(papers: PapersDoc, ctx: OutcomeContext): Determ
   if (ctx.allMaterialsUnreadable) return "insufficient_materials";
   const gapProofs = openGaps.filter((g) => g.category !== "budget");
   if (gapProofs.length > 0) return "insufficient_materials";
-  const pendingProofs = papers.items.filter(
-    (i) => i.status === "pending" && (i.missing_role !== null || isSubstantivePendingReason(i.pending_reason)),
-  );
-  if (papers.items.length > 0 && pendingProofs.length > 0) return "insufficient_materials";
+  const missingRoleProofs = papers.items.filter((i) => i.status === "pending" && i.missing_role !== null);
+  if (papers.items.length > 0 && missingRoleProofs.length > 0) return "insufficient_materials";
 
-  // 空底稿 / 普通待执行 / 状态查询失败：不能推出缺材料 → 无有效产出
+  // 空底稿 / 普通待执行 / 状态查询失败 / 仅技术原因：不能推出缺材料 → 无有效产出
   return "no_valid_output";
 }
 
@@ -68,13 +60,15 @@ export interface ComposeInput {
   extraNotes?: string[];
 }
 
-/** 任务级缺口的正文行（v0.6 §4：全局缺口也进入正文）。 */
+/** 任务级缺口的正文行（v0.6 §4：全局缺口也进入正文；已解决的不列）。 */
 function taskGapLines(papers: PapersDoc): string[] {
-  return (papers.task_gaps ?? []).map((gap) => {
-    const label = gap.label ?? (gap.doc_id ? `${gap.doc_id}@v${gap.version ?? "?"}` : null) ?? (gap.missing_role ? `用途「${gap.missing_role}」` : null);
-    const scope = label ? `（${label}）` : "";
-    return `- ${gapCategoryText(gap.category)}${scope}：${gap.statement}。影响：${gap.impact}`;
-  });
+  return (papers.task_gaps ?? [])
+    .filter((gap) => gap.resolved !== true)
+    .map((gap) => {
+      const label = gap.label ?? (gap.doc_id ? `${gap.doc_id}@v${gap.version ?? "?"}` : null) ?? (gap.missing_role ? `用途「${gap.missing_role}」` : null);
+      const scope = label ? `（${label}）` : "";
+      return `- ${gapCategoryText(gap.category)}${scope}：${gap.statement}。影响：${gap.impact}`;
+    });
 }
 
 function gapCategoryText(category: string): string {
@@ -113,8 +107,9 @@ export function composeConclusion(input: ComposeInput): ComposedResult {
   const allNotApplicable =
     stats.scopeDetermined && stats.applicable === 0 && naItems.length > 0 && findings.length === 0;
 
-  // B2：全部不适用是独立交付口径，conclusion_hint 不能覆盖运行时判定
-  if (allNotApplicable) {
+  // B2/P1-5：全部不适用是独立交付口径，仅在 complete（无未决缺口）时使用；
+  // 其他覆盖值（如专项仍待确定）走通用组装，避免跳过缺口与材料问题。
+  if (allNotApplicable && outcome === "complete") {
     sections.push("【结论】\n本次规则均不适用。已确认的规则卡各项均给出不适用理由，详见核查范围摘要。");
     sections.push(
       `【核查范围摘要】\n${scopeSummary(stats, naItems, usedMaterials)}\n- 逐项不适用理由：\n${naItems
@@ -197,16 +192,17 @@ export function composeConclusion(input: ComposeInput): ComposedResult {
   };
 }
 
+/** 首句由覆盖值与缺口决定，再按相容性采纳模型提示（P1-5）：
+ * conclusion_hint 只在 complete 时作为结论口径；partial/insufficient 一律用运行时口径，
+ * 避免出现“拟同意。现有材料不足以开展实质审核”这类自相矛盾的首句。 */
 function conclusionLine(papers: PapersDoc, outcome: ReviewOutcome, stats: ReturnType<typeof coverageStats>): string {
-  if (papers.conclusion_hint) {
-    const suffix =
-      outcome === "complete" && stats.findings === 0
-        ? "本次审核未发现问题。"
-        : outcome === "partial"
-          ? "本次基于现有材料出具部分意见。"
-          : outcome === "insufficient_materials"
-            ? "现有材料不足以开展实质审核。"
-            : "";
+  const openGaps = stats.openTaskGaps;
+  const missingMaterialEvidence =
+    openGaps.some((g) => g.category === "missing_material" || g.category === "file_issue") ||
+    papers.items.some((i) => i.status === "pending" && i.missing_role !== null);
+
+  if (outcome === "complete" && papers.conclusion_hint) {
+    const suffix = stats.findings === 0 ? "本次审核未发现问题。" : "";
     return suffix ? `${papers.conclusion_hint}。${suffix}` : `${papers.conclusion_hint}。`;
   }
   switch (outcome) {
@@ -215,7 +211,9 @@ function conclusionLine(papers: PapersDoc, outcome: ReviewOutcome, stats: Return
         ? `请修改后再提交。本次审核发现 ${stats.findings} 项问题，详见审核意见。`
         : "拟同意。本次审核未发现问题，核查范围见摘要。";
     case "partial":
-      return "请补充材料后再提交。本次基于现有材料出具部分意见，未能核查的事项见下文。";
+      return missingMaterialEvidence
+        ? "请补充材料后提交新任务。本次基于现有材料出具部分意见，未能核查的事项见下文。"
+        : "本次基于现有进度交付部分意见，未完成的原因见下文（如需完整核查，可在补齐条件后提交新任务）。";
     case "insufficient_materials":
       return "无法开展实质审核。现有材料不足以支撑审查，所需材料见下文。";
   }

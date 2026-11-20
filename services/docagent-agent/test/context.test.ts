@@ -42,7 +42,9 @@ describe("fitMessagesToBudget", () => {
     ];
     const fitted = fitMessagesToBudget(messages, { budget: 1_000 });
     expect(fitted.dropped).toBeGreaterThan(0);
-    expect(fitted.messages[0]!.content).toContain("已省略");
+    // 首条 user（任务输入）保留，省略标记紧随其后，末条 assistant 保留
+    expect(fitted.messages[0]!.content).toBe("首个任务说明");
+    expect(String(fitted.messages[1]!.content)).toContain("已省略");
     expect(fitted.messages[fitted.messages.length - 1]!.content).toBe("结束");
   });
 
