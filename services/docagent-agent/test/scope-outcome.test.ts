@@ -23,7 +23,7 @@ afterEach(() => {
 
 const materials = [{ doc_id: "d_01", version: 1, label: "主合同.docx", role: "主合同" }];
 
-const item = (overrides: Record<string, unknown> = {}) => ({
+const item = (overrides: Partial<import("../src/types.js").PaperItem> = {}): import("../src/types.js").PaperItem => ({
   item_id: "a",
   rule_card: "C1",
   status: "checked",
@@ -111,6 +111,7 @@ describe("B1 活动范围固定", () => {
     const papers = enforceActiveScope(
       {
         scope: { rule_cards: ["C1"], expected_item_ids: ["a", "b"] },
+        task_gaps: [],
         conclusion_hint: null,
         items: [item()], // b 被意外丢弃
       },
@@ -156,8 +157,8 @@ describe("v0.6 任务级缺口与无效产出判定", () => {
       determineOutcome(
         {
           scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
-          conclusion_hint: null,
           task_gaps: [],
+          conclusion_hint: null,
           items: [item({ status: "pending", finding: null, pending_reason: "待执行" })],
         },
         { revisionMaterials: materials, materialIssues: [] },
@@ -202,7 +203,7 @@ describe("v0.6 任务级缺口与无效产出判定", () => {
 });
 
 describe("P1-5 全不适用与缺口并存", () => {
-  it("全不适用 + 专项待确定 → partial/insufficient，正文不丢缺口，不用「均不适用」结论", () => {
+  it("全不适用 + 专项待确定 → insufficient（零已核+事实缺口），正文不丢缺口，不用「均不适用」结论", () => {
     const papers = {
       scope: { rule_cards: ["C1 共性"], expected_item_ids: ["a"] },
       conclusion_hint: null,
@@ -211,11 +212,16 @@ describe("P1-5 全不适用与缺口并存", () => {
       ],
       items: [item({ item_id: "a", status: "not_applicable", not_applicable_reason: "共性项不涉密" })],
     };
-    const outcome = determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] });
-    expect(outcome).toBe("partial"); // 0 已核 + 事实缺口本可 insufficient，但有 not_applicable 记录时按 partial 展示缺口
-    const composed = composeConclusion({ papers, outcome: "partial", ctx: { revisionMaterials: materials, materialIssues: [] } });
+    const ctx = { revisionMaterials: materials, materialIssues: [] };
+    const outcome = determineOutcome(papers, ctx);
+    // v0.6 §4：零项实质核查 + 可明确指出的事实缺口 → insufficient_materials
+    expect(outcome).toBe("insufficient_materials");
+    const composed = composeConclusion({ papers, outcome: outcome as "insufficient_materials", ctx });
     expect(composed.conclusion_md).toContain("专项规则待确定");
     expect(composed.conclusion_md).not.toContain("本次规则均不适用");
+    // 首句读【结论】标题后的正文：覆盖值与首句一致
+    const conclusionBody = composed.conclusion_md.split("【结论】")[1]!.split("\n")[1] ?? "";
+    expect(conclusionBody).toContain("无法开展实质审核");
   });
 
   it("conclusion_hint=拟同意 与 partial 不相容 → 首句用运行时口径", () => {
@@ -229,8 +235,7 @@ describe("P1-5 全不适用与缺口并存", () => {
       ],
     };
     const composed = composeConclusion({ papers, outcome: "partial", ctx: { revisionMaterials: materials, materialIssues: [] } });
-    expect(composed.conclusion_md.split("
-")[0]).not.toContain("拟同意");
+    expect(composed.conclusion_md.split("\n")[0]).not.toContain("拟同意");
     expect(composed.conclusion_md).toContain("请补充材料");
   });
 
@@ -242,7 +247,6 @@ describe("P1-5 全不适用与缺口并存", () => {
         scope: { rule_cards: ["C1"], expected_item_ids: ["a"] },
         scope_change_reason: "想缩小范围",
         conclusion_hint: null,
-        task_gaps: [],
         items: [item()],
       },
       materials,
@@ -251,10 +255,29 @@ describe("P1-5 全不适用与缺口并存", () => {
     expect(shrunkWithReason.ok).toBe(false);
     if (!shrunkWithReason.ok) expect(shrunkWithReason.errors.join()).toContain("不允许删减");
 
-    // 漏写已登记缺口 → 拒绝
+    // 已登记缺口（供后续断言共用）
     const previousGaps = [
       { gap_id: "g1", category: "route_undetermined" as const, statement: "专项待定", impact: "x" },
     ];
+
+    // 复核：省略 task_gaps 字段或传 null 同样被拒（不依赖数组分支）
+    for (const missing of [undefined, null]) {
+      const omitted = validatePapers(
+        {
+          scope: { rule_cards: ["C1"], expected_item_ids: ["a", "b"] },
+          conclusion_hint: null,
+          ...(missing === null ? { task_gaps: null } : {}),
+          items: [item(), item({ item_id: "b", status: "pending", finding: null, pending_reason: "待执行" })],
+        },
+        materials,
+        db.getActiveScope("t1", 1),
+        previousGaps,
+      );
+      expect(omitted.ok).toBe(false);
+      if (!omitted.ok) expect(omitted.errors.join()).toContain("不能省略 task_gaps");
+    }
+
+    // 漏写已登记缺口 → 拒绝
     const dropped = validatePapers(
       {
         scope: { rule_cards: ["C1"], expected_item_ids: ["a", "b"] },
@@ -290,6 +313,40 @@ describe("P1-5 全不适用与缺口并存", () => {
   });
 });
 
+describe("P1-4 复核：同卡扩展原子更新范围", () => {
+  it("同卡新增检查项：校验通过且活动范围同步扩展（发布分母含新增项）", () => {
+    db.saveActiveScope("t2", 1, { rule_cards: ["C1"], expected_item_ids: ["c1"], reason: "initial" });
+    const extended = validatePapers(
+      {
+        scope: { rule_cards: ["C1"], expected_item_ids: ["c1", "c2"] },
+        conclusion_hint: null,
+        items: [
+          item({ item_id: "c1" }),
+          item({ item_id: "c2", status: "pending", finding: null, pending_reason: "待执行" }),
+        ],
+      },
+      materials,
+      db.getActiveScope("t2", 1),
+    );
+    expect(extended.ok).toBe(true);
+    if (extended.ok) {
+      expect(extended.scopeExtended).toBe(true);
+      expect(extended.scopeChanged).toBe(false);
+      // 模拟 tools 层的原子登记：范围扩展为 c1+c2
+      db.saveActiveScope("t2", 1, {
+        rule_cards: extended.papers.scope!.rule_cards,
+        expected_item_ids: extended.papers.scope!.expected_item_ids,
+        reason: "same-card-extended",
+      });
+      expect(db.getActiveScope("t2", 1)?.expected_item_ids).toEqual(["c1", "c2"]);
+      // 发布用底稿（enforceActiveScope）保留 c2，不能判 complete
+      const enforced = enforceActiveScope(extended.papers, db.getActiveScope("t2", 1));
+      expect(enforced.items.map((i) => i.item_id)).toEqual(["c1", "c2"]);
+      expect(determineOutcome(enforced, { revisionMaterials: materials, materialIssues: [] })).toBe("partial");
+    }
+  });
+});
+
 describe("B2 全部不适用", () => {
   it("全部不适用 → complete，结论写“本次规则均不适用”，逐项理由列出；hint 不覆盖", () => {
     const papers = {
@@ -305,7 +362,7 @@ describe("B2 全部不适用", () => {
     expect(outcome).toBe("complete");
     const composed = composeConclusion({
       papers,
-      outcome,
+      outcome: outcome as "complete",
       ctx: { revisionMaterials: materials, materialIssues: [] },
     });
     expect(composed.conclusion_md).toContain("本次规则均不适用");
@@ -324,7 +381,7 @@ describe("B2 全部不适用", () => {
     };
     const composed = composeConclusion({
       papers,
-      outcome: determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] }),
+      outcome: determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] }) as "complete",
       ctx: { revisionMaterials: materials, materialIssues: [] },
     });
     expect(composed.conclusion_md).toContain("本次审核未发现问题");

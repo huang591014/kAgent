@@ -277,8 +277,10 @@ $("cancel-task").onclick = async () => {
 };
 
 async function renderResult(status) {
+  const requestedTask = state.taskId;
   try {
-    const result = await api(`/api/tasks/${state.taskId}/result`);
+    const result = await api(`/api/tasks/${requestedTask}/result`);
+    if (state.taskId !== requestedTask) return; // P2：过期的结果响应（已切换任务）不更新视图
     if (result.conclusion_md) {
       $("result-card").hidden = false;
       const outcomeBadge = $("result-outcome");
@@ -303,6 +305,7 @@ async function renderResult(status) {
         <p class="muted">${escapeHtml(result.reason || "")}</p>`;
     }
   } catch (error) {
+    if (state.taskId !== requestedTask) return; // 过期响应
     $("terminal-card").hidden = false;
     $("terminal-body").textContent = `结果获取失败：${error.message}`;
   }

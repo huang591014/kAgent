@@ -92,21 +92,44 @@ function seedTask(skillRef: string = installedSkillRef): string {
   return taskId;
 }
 
+const TEST_CONTRACT_BLOCK = {
+  block_id: "b0001",
+  ordinal: 1,
+  kind: "text",
+  heading_path: "第五条 付款",
+  locator: { page: 3 },
+  text: "甲方在验收合格后30日内支付全部合同款项。本合同未约定验收通过标准及确认人。",
+  text_quality: "ok",
+};
+
 function depsFor(model: LanguageModel): RunnerDeps {
   return {
     db,
     skills,
     retrieval: {
-      search: async () => {
-        throw new Error("检索未在本测试范围");
-      },
-      read: async () => {
-        throw new Error("回读未在本测试范围");
-      },
+      // 检索替身：命中 d_01@1 的测试合同块（P1-1 复核正例的读取证据来源）
+      search: async () => ({
+        total: 1,
+        hits: [{ doc_id: "d_01", version: 1, block_id: "b0001", ordinal: 1, kind: "text", heading_path: "第五条 付款", snippet: "验收合格后30日内支付" }],
+      }),
+      read: async () => ({
+        blocks: [TEST_CONTRACT_BLOCK],
+        next_cursor: 1,
+        eof: true,
+      }),
     } as never,
     activeRuns: new Map(),
     modelFactory: () => model,
   };
+}
+
+function bindContract(taskId: string): void {
+  db.db
+    .prepare(
+      `INSERT INTO task_inputs (task_id, revision, seq, doc_id, version, role, label, origin_kind, origin_request)
+       VALUES (?, 1, 1, 'd_01', 1, '主合同', '测试合同.docx', 'initial', NULL)`,
+    )
+    .run(taskId);
 }
 
 const FULL_PAPERS = {
@@ -119,7 +142,7 @@ const FULL_PAPERS = {
       rule_card: "C1 共性",
       status: "checked",
       finding: { problem: "未约定验收标准", suggestion: "补充验收标准" },
-      used_materials: [],
+      used_materials: [{ doc_id: "d_01", version: 1 }],
       pending_reason: null,
       missing_role: null,
       not_applicable_reason: null,
@@ -129,7 +152,7 @@ const FULL_PAPERS = {
       rule_card: "C1 共性",
       status: "checked",
       finding: null,
-      used_materials: [],
+      used_materials: [{ doc_id: "d_01", version: 1 }],
       pending_reason: null,
       missing_role: null,
       not_applicable_reason: null,
@@ -164,35 +187,43 @@ const PAPERS_WITH_GAP = {
 };
 
 describe("runTask（模型替身 e2e，v0.6 单次提交）", () => {
-  it("工具循环贯通：三次请求到达替身，底稿落盘并发布 complete 结果", async () => {
+  it("工具循环贯通（正例）：加载 skill → 检索读到合同 → 底稿引用 → complete", async () => {
     const taskId = seedTask();
+    bindContract(taskId);
     const { model, prompts } = makeFakeModel([
       { toolCalls: [{ id: "call_1", name: "skill", input: {} }] },
-      { toolCalls: [{ id: "call_2", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
+      { toolCalls: [{ id: "call_2", name: "mcp__doc_retrieval__doc_search", input: { query: "付款 验收" } }] },
+      { toolCalls: [{ id: "call_3", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
       { text: "审核完成，意见如底稿所述。" },
     ]);
-    // 绑定真实安装的 skill 版本（P1-1：成功加载是发布凭据）
 
     await runTask(depsFor(model), taskId);
 
-    expect(prompts).toHaveLength(3); // 验收：三次请求都实际到达替身
+    expect(prompts).toHaveLength(4); // 四次请求都实际到达替身
     expect(JSON.stringify(prompts[1]!.messages)).toContain("call_1");
     expect(JSON.stringify(prompts[2]!.messages)).toContain("call_2");
+    expect(JSON.stringify(prompts[3]!.messages)).toContain("call_3");
 
     const task = db.getTask(taskId)!;
     expect(task.status).toBe("completed");
     const result = db.db.prepare("SELECT * FROM results WHERE task_id = ?").get(taskId) as Record<string, unknown>;
     expect(result.review_outcome).toBe("complete");
     expect(String(result.conclusion_md)).toContain("未约定验收标准");
+    // used_materials 引用实际读过的版本（材料级引用）
+    expect(JSON.parse(String(result.used_materials))).toEqual([{ doc_id: "d_01", version: 1, label: "测试合同.docx" }]);
     const scope = db.getActiveScope(taskId, 1);
     expect(scope?.expected_item_ids).toEqual(["c1", "c2"]);
   });
 
   it("纯追问只纠正一次：nudge 后登记 task_gaps → partial 交付", async () => {
     const taskId = seedTask();
+    bindContract(taskId);
     const { model, prompts } = makeFakeModel([
       { toolCalls: [{ id: "call_s", name: "skill", input: {} }] },
       { text: "请确认合同类型？是运维服务还是人员外包？" }, // 纯追问 → nudge
+      { toolCalls: [
+        { id: "call_r", name: "mcp__doc_retrieval__doc_search", input: { query: "付款 验收" } },
+      ] },
       { toolCalls: [{ id: "call_w", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(PAPERS_WITH_GAP) } }] },
       { text: "已按共性规则核查，缺口登记完毕。" },
     ]);
@@ -200,7 +231,7 @@ describe("runTask（模型替身 e2e，v0.6 单次提交）", () => {
     await runTask(depsFor(model), taskId);
 
     // nudge 消息进入了追问后的那次请求
-    expect(prompts).toHaveLength(4);
+    expect(prompts).toHaveLength(5);
     const nudgeMessage = JSON.stringify(prompts[2]!.messages);
     expect(nudgeMessage).toContain("不与用户交互");
     expect(nudgeMessage).toContain("task_gaps");
@@ -251,21 +282,15 @@ describe("P1-1 凭据闸门", () => {
 
     const task = db.getTask(taskId)!;
     expect(task.status).toBe("failed");
-    expect(task.status_reason).toContain("skill");
+    expect(task.status_reason).toBeTruthy(); // skill 加载失败 → 底稿写入被拒/无凭据 → 终态 failed
     const result = db.db.prepare("SELECT COUNT(*) AS n FROM results WHERE task_id = ?").get(taskId) as { n: number };
     expect(result.n).toBe(0); // 未发布任何结果
   });
 
-  it("材料存在但从未读取（无检索/回读成功）时，实质发现不能发布", async () => {
+  it("材料存在但从未读取时，任何已核结论都不能发布 complete", async () => {
     const taskId = seedTask();
-    const now = Date.now();
-    db.db
-      .prepare(
-        `INSERT INTO task_inputs (task_id, revision, seq, doc_id, version, role, label, origin_kind, origin_request)
-         VALUES (?, 1, 1, 'd_01', 1, '主合同', '主合同.docx', 'initial', NULL)`,
-      )
-      .run(taskId);
-    // docStatusCache 查询会失败（无 pipeline）→ 材料状态 unknown；readDocs 为空
+    bindContract(taskId);
+    // 序列不调用任何检索/回读 → readDocs 为空
     const { model } = makeFakeModel([
       { toolCalls: [{ id: "call_s", name: "skill", input: {} }] },
       { toolCalls: [{ id: "call_w", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
@@ -274,15 +299,73 @@ describe("P1-1 凭据闸门", () => {
 
     await runTask(depsFor(model), taskId);
 
-    // write_file 阶段：有材料任务 + 实质发现 + 未引用读过文件 → 底稿写入被拒；
-    // 模型重试耗尽后结束，findings 依据不足 → failed（不发布）
+    // 写校验拒绝"引用未读版本"，底稿未写入 → 不发布 complete
     const task = db.getTask(taskId)!;
-    expect(["failed", "completed"]).toContain(task.status);
-    if (task.status === "completed") {
-      // 若底稿整体被拒、papers 空 → no_valid_output → failed；此断言保护误发布路径
-      const row = db.db.prepare("SELECT review_outcome FROM results WHERE task_id = ?").get(taskId) as { review_outcome: string };
-      expect(row.review_outcome).not.toBe("complete");
-    }
+    expect(task.status).toBe("failed");
+    const result = db.db.prepare("SELECT COUNT(*) AS n FROM results WHERE task_id = ?").get(taskId) as { n: number };
+    expect(result.n).toBe(0);
+  });
+
+  it("已核无发现（finding=null）同样需要读取凭据：未读材料不得发布“拟同意”", async () => {
+    const taskId = seedTask();
+    bindContract(taskId);
+    const noFindingPapers = {
+      ...FULL_PAPERS,
+      items: FULL_PAPERS.items.map((i) => ({ ...i, finding: null })),
+    };
+    const { model } = makeFakeModel([
+      { toolCalls: [{ id: "call_s", name: "skill", input: {} }] },
+      // 模型直接登记已核无发现（未读取）——写校验与发布闸门均不得放行
+      { toolCalls: [{ id: "call_w", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(noFindingPapers) } }] },
+      { text: "完成。" },
+    ]);
+
+    await runTask(depsFor(model), taskId);
+
+    const task = db.getTask(taskId)!;
+    expect(task.status).toBe("failed");
+    const result = db.db.prepare("SELECT COUNT(*) AS n FROM results WHERE task_id = ?").get(taskId) as { n: number };
+    expect(result.n).toBe(0);
+  });
+
+  it("旧检查点缺少凭据列时，从成功回执重建（skill 成功+检索命中才有凭据）", async () => {
+    const taskId = seedTask();
+    bindContract(taskId);
+    const now = Date.now();
+    // 旧检查点：无 evidence 列，消息含 skill 成功回执与检索命中回执
+    const legacyMessages = [
+      { role: "user", content: "任务说明" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c_s", name: "skill", input: {} }] },
+      { role: "tool", content: [{ toolCallId: "c_s", toolName: "skill", output: { content: "技能正文" }, isError: false }] },
+      { role: "assistant", content: "", toolCalls: [{ id: "c_r", name: "doc_search", input: { query: "付款" } }] },
+      { role: "tool", content: [{ toolCallId: "c_r", toolName: "doc_search", output: { hits: [{ doc_id: "d_01", version: 1 }] }, isError: false }] },
+      { role: "assistant", content: "", toolCalls: [{ id: "c_e", name: "doc_read", input: { doc_id: "d_01", version: 1 } }] },
+      { role: "tool", content: [{ toolCallId: "c_e", toolName: "doc_read", output: { blocks: [] }, isError: false }] }, // 空回读不算
+    ];
+    db.saveCheckpoint({
+      task_id: taskId,
+      batch: "run_old",
+      step_no: 3,
+      input_revision: 1,
+      messages: JSON.stringify(legacyMessages),
+      papers: JSON.stringify({ scope: null, items: [], task_gaps: [], conclusion_hint: null }),
+      evidence: null,
+      created_at: now - 1000,
+    });
+
+    const { model, prompts } = makeFakeModel([
+      { toolCalls: [{ id: "call_w", name: "write_file", input: { path: WORKING_PAPERS_PATH, content: JSON.stringify(FULL_PAPERS) } }] },
+      { text: "完成。" },
+    ]);
+    await runTask(depsFor(model), taskId);
+
+    // 恢复上下文复用旧检查点（同修订）；凭据从回执重建：
+    // skillLoaded=true、readDocs={d_01@1}（doc_search 命中；空 doc_read 不计入）→ complete
+    expect(JSON.stringify(prompts[0]!.messages)).toContain("任务说明");
+    const task = db.getTask(taskId)!;
+    expect(task.status).toBe("completed");
+    const result = db.db.prepare("SELECT * FROM results WHERE task_id = ?").get(taskId) as Record<string, unknown>;
+    expect(result.review_outcome).toBe("complete");
   });
 });
 

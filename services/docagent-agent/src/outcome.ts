@@ -15,6 +15,9 @@ export interface OutcomeContext {
   materialIssues: MaterialIssue[];
   /** 全部材料是否都**明确**不可读（failed/needs_ocr/超时；查询失败不算，v0.6 §4） */
   allMaterialsUnreadable?: boolean;
+  /** 材料性不可读的版本集合（P1-3 复核）：file_issue 缺口仅当其文件属于该集合时
+   * 才视为材料性证据；纯技术故障（索引写入失败等）不算用户缺材料 */
+  materialUnreadableDocs?: ReadonlySet<string>;
 }
 
 /** 内部判定值：无可交付审核结果且无已证实的材料/事实缺口 → 交由运行时按 failed 处理。 */
@@ -41,9 +44,20 @@ export function determineOutcome(papers: PapersDoc, ctx: OutcomeContext): Determ
   }
   if (stats.checked >= 1) return "partial";
 
-  // 零已核：只有可明确指出的材料/事实缺口才交付 insufficient
+  // 零已核：只有可明确指出的材料/事实缺口才交付 insufficient。
+  // file_issue 需其文件确属材料性不可读（扫描件/不可重试失败）才算材料证据；
+  // 已提交文件的纯技术故障（如索引写入失败）不算用户缺材料（P1-3 复核）。
   if (ctx.allMaterialsUnreadable) return "insufficient_materials";
-  const gapProofs = openGaps.filter((g) => g.category !== "budget");
+  const materialUnreadable = ctx.materialUnreadableDocs ?? new Set<string>();
+  const gapProofs = openGaps.filter((g) => {
+    if (g.category === "budget") return false;
+    if (g.category === "file_issue") {
+      return g.doc_id !== undefined && g.version !== undefined
+        ? materialUnreadable.has(`${g.doc_id}@${g.version}`)
+        : false;
+    }
+    return true; // missing_material / missing_fact / route_undetermined 为结构性证据
+  });
   if (gapProofs.length > 0) return "insufficient_materials";
   const missingRoleProofs = papers.items.filter((i) => i.status === "pending" && i.missing_role !== null);
   if (papers.items.length > 0 && missingRoleProofs.length > 0) return "insufficient_materials";
@@ -111,6 +125,14 @@ export function composeConclusion(input: ComposeInput): ComposedResult {
   // 其他覆盖值（如专项仍待确定）走通用组装，避免跳过缺口与材料问题。
   if (allNotApplicable && outcome === "complete") {
     sections.push("【结论】\n本次规则均不适用。已确认的规则卡各项均给出不适用理由，详见核查范围摘要。");
+    // P1-5 复核：该分支同样输出材料处理说明——无关附件失败不影响完整交付，但必须进入正文
+    if (ctx.materialIssues.length > 0) {
+      sections.push(
+        `【材料处理说明】\n${ctx.materialIssues
+          .map((issue) => `- 「${issue.label}」${issue.issue}：${issue.impact}。该问题不影响本次核查范围的适用性判定。`)
+          .join("\n")}`,
+      );
+    }
     sections.push(
       `【核查范围摘要】\n${scopeSummary(stats, naItems, usedMaterials)}\n- 逐项不适用理由：\n${naItems
         .map((i) => `  · ${i.item_id}（${i.rule_card}）：${i.not_applicable_reason}`)
@@ -124,7 +146,7 @@ export function composeConclusion(input: ComposeInput): ComposedResult {
     };
   }
 
-  sections.push(`【结论】\n${conclusionLine(papers, outcome, stats)}`);
+  sections.push(`【结论】\n${conclusionLine(papers, outcome, stats, ctx)}`);
 
   if (outcome === "insufficient_materials") {
     const gaps: string[] = [...taskGapLines(papers)];
@@ -194,12 +216,25 @@ export function composeConclusion(input: ComposeInput): ComposedResult {
 
 /** 首句由覆盖值与缺口决定，再按相容性采纳模型提示（P1-5）：
  * conclusion_hint 只在 complete 时作为结论口径；partial/insufficient 一律用运行时口径，
- * 避免出现“拟同意。现有材料不足以开展实质审核”这类自相矛盾的首句。 */
-function conclusionLine(papers: PapersDoc, outcome: ReviewOutcome, stats: ReturnType<typeof coverageStats>): string {
+ * 避免出现“拟同意。现有材料不足以开展实质审核”这类自相矛盾的首句。
+ * “请补充材料”首句同样只认材料性证据：file_issue 须其文件属材料性不可读（P1-3 复核）。 */
+function conclusionLine(
+  papers: PapersDoc,
+  outcome: ReviewOutcome,
+  stats: ReturnType<typeof coverageStats>,
+  ctx: OutcomeContext,
+): string {
   const openGaps = stats.openTaskGaps;
+  const materialUnreadable = ctx.materialUnreadableDocs ?? new Set<string>();
   const missingMaterialEvidence =
-    openGaps.some((g) => g.category === "missing_material" || g.category === "file_issue") ||
-    papers.items.some((i) => i.status === "pending" && i.missing_role !== null);
+    openGaps.some(
+      (g) =>
+        g.category === "missing_material" ||
+        (g.category === "file_issue" &&
+          g.doc_id !== undefined &&
+          g.version !== undefined &&
+          materialUnreadable.has(`${g.doc_id}@${g.version}`)),
+    ) || papers.items.some((i) => i.status === "pending" && i.missing_role !== null);
 
   if (outcome === "complete" && papers.conclusion_hint) {
     const suffix = stats.findings === 0 ? "本次审核未发现问题。" : "";

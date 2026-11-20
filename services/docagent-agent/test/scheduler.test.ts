@@ -28,14 +28,22 @@ import { Scheduler } from "../src/scheduler.js";
 
 let baseDir: string;
 let db: Db;
+let activeScheduler: Scheduler | null = null;
 
 beforeEach(() => {
   baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "sched-test-"));
   db = new Db(path.join(baseDir, "agent.db"));
   statusMap.clear();
+  activeScheduler = null;
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // 复核要求：等在途派发收尾再关库，stop 阻止 finally 里的 kick 再触碰已关闭的 SQLite
+  if (activeScheduler) {
+    activeScheduler.stop();
+    await activeScheduler.quiesce();
+  }
+  await new Promise((resolve) => setImmediate(resolve));
   db.close();
   fs.rmSync(baseDir, { recursive: true, force: true });
 });
@@ -61,10 +69,13 @@ function seedTask(taskId: string, status: string): void {
 }
 
 async function tick(scheduler: Scheduler): Promise<void> {
-  // 注入 deps（start 会起定时器，tick 前手动停掉）
+  activeScheduler = scheduler;
+  // 注入 deps（start 会起定时器，tick 前手动停掉；stopped 标志随后被 tick 使用前重置）
   scheduler.start(deps());
   scheduler.stop();
+  (scheduler as unknown as { stopped: boolean }).stopped = false; // 手动 tick 需要调度生效
   await (scheduler as unknown as { tick(): Promise<void> }).tick();
+  await scheduler.quiesce(); // 等 runTask 替身与后续 kick 收尾
 }
 
 function deps() {
@@ -132,6 +143,43 @@ describe("P1-2 调度等待集合", () => {
     await tick(scheduler);
 
     expect(db.getTask("t_cancel")!.status).toBe("cancelled");
+  });
+
+  it("P1-2 复核：主合同已就绪不唤醒等待纪要的任务（活跃等待只含纪要）", async () => {
+    seedTask("t_focus", "waiting_index");
+    statusMap.set("d_a@1", { ready: true, status: "ready" }); // 主合同：就绪，但不是等待对象
+    statusMap.set("d_b@1", { ready: false, status: "indexing" }); // 纪要：仍在处理
+    const now = Date.now();
+    // 活跃等待记录只有纪要
+    db.db
+      .prepare("INSERT INTO index_waits (task_id, input_revision, doc_id, version, since, deadline, decided) VALUES ('t_focus', 1, 'd_b', 1, ?, ?, NULL)")
+      .run(now - 1000, now + 600_000);
+
+    const scheduler = new Scheduler(db);
+    await tick(scheduler);
+    await tick(scheduler); // 连续两轮
+
+    // 任务保持 waiting_index：主合同状态无关唤醒；不派发即不消耗模型步数
+    expect(db.getTask("t_focus")!.status).toBe("waiting_index");
+  });
+
+  it("P1-2 复核：等待的纪要就绪才唤醒（活跃等待记 ready）", async () => {
+    seedTask("t_ready", "waiting_index");
+    statusMap.set("d_a@1", { ready: true, status: "ready" });
+    statusMap.set("d_b@1", { ready: true, status: "ready" });
+    const now = Date.now();
+    db.db
+      .prepare("INSERT INTO index_waits (task_id, input_revision, doc_id, version, since, deadline, decided) VALUES ('t_ready', 1, 'd_b', 1, ?, ?, NULL)")
+      .run(now - 1000, now + 600_000);
+
+    const scheduler = new Scheduler(db);
+    await tick(scheduler);
+
+    expect(db.getTask("t_ready")!.status).toBe("queued");
+    const decided = db.db
+      .prepare("SELECT decided FROM index_waits WHERE task_id = 't_ready' AND doc_id = 'd_b'")
+      .get() as { decided: string };
+    expect(decided.decided).toBe("ready");
   });
 });
 

@@ -6,7 +6,7 @@ const materials = [
   { doc_id: "d_02", version: 2, label: "采购纪要.docx", role: "纪要" },
 ];
 
-const validItem = (overrides: Record<string, unknown> = {}) => ({
+const validItem = (overrides: Partial<import("../src/types.js").PaperItem> = {}): import("../src/types.js").PaperItem => ({
   item_id: "c6-payment",
   rule_card: "C6 付款与发票",
   status: "checked",
@@ -68,7 +68,7 @@ describe("validatePapers", () => {
 
   it("finding 必须包含 problem 与 suggestion", () => {
     const bad = validatePapers(
-      { items: [validItem({ finding: { problem: "只有问题" } })] },
+      { items: [validItem({ finding: { problem: "只有问题" } as never })] } as never,
       materials,
     );
     expect(bad.ok).toBe(false);
@@ -117,6 +117,7 @@ describe("coverageStats", () => {
   it("统计已核/待核/不适用与发现数", () => {
     const stats = coverageStats({
       scope: { rule_cards: ["共性"], expected_item_ids: ["a", "b", "c"] },
+       task_gaps: [],
       conclusion_hint: null,
       items: [
         validItem({ item_id: "a" }),
@@ -137,6 +138,7 @@ describe("invalidateForReplace", () => {
   it("引用旧版本的意见标为待复核且清掉 finding", () => {
     const papers = {
       scope: { rule_cards: ["共性"], expected_item_ids: ["a", "b"] },
+       task_gaps: [],
       conclusion_hint: null,
       items: [
         validItem({ item_id: "a", used_materials: [{ doc_id: "d_01", version: 1 }] }),
@@ -157,6 +159,7 @@ describe("collectUsedMaterials", () => {
     const used = collectUsedMaterials(
       {
         scope: null,
+         task_gaps: [],
         conclusion_hint: null,
         items: [
           validItem({ item_id: "a", used_materials: [{ doc_id: "d_01", version: 1 }, { doc_id: "d_02", version: 2 }] }),

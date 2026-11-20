@@ -47,7 +47,6 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
   const controller = new AbortController();
   deps.activeRuns.set(taskId, controller);
   const task = claim.task;
-  const startedAt = Date.now();
 
   const materials = db.latestMaterials(taskId).map((m) => ({
     doc_id: m.doc_id,
@@ -67,14 +66,22 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
     docStatusCache: new Map(),
     papers,
     activeScope: db.getActiveScope(taskId, task.input_revision),
-    evidence: restoreEvidence(db, taskId, task.input_revision, papers),
+    evidence: { skillLoaded: false, readDocs: new Set<string>() }, // 先占位，消息恢复后按回执重建
   };
 
   const usage = loadUsage(task.usage);
+  // P2 复核：活动时长按结算点累计——等待/重启前把本批次增量结算进持久化用量
+  const wallMark = { lastAt: Date.now() };
+  const settleWall = (): void => {
+    usage.wall_seconds += Math.round((Date.now() - wallMark.lastAt) / 1000);
+    wallMark.lastAt = Date.now();
+  };
 
   try {
     await refreshStatusCache(ctx);
     let messages = restoreMessages(deps, ctx, task);
+    // P1-1 复核：凭据从恢复消息中的成功回执重建（与实时登记同一口径）
+    ctx.evidence = restoreEvidence(db, taskId, task.input_revision, papers, messages);
 
     let nudgedOnce = false;
     let stepGuard = usage.steps;
@@ -84,8 +91,8 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
       const taskNow = db.getTask(taskId);
       if (!taskNow || taskNow.status === "cancelled") throw new CancelledError();
 
-      // ===== 预算检查（设计 §4.4）：wall 为历史累计 + 本批次增量，不重复相加 =====
-      const wallMinutes = (usage.wall_seconds * 1000 + (Date.now() - startedAt)) / 60_000;
+      // ===== 预算检查（设计 §4.4）：wall 为历史累计 + 当前未结算增量 =====
+      const wallMinutes = (usage.wall_seconds * 1000 + (Date.now() - wallMark.lastAt)) / 60_000;
       const budgetNotes: string[] = [];
       let budgetExhausted = false;
       if (stepGuard >= config.maxSteps) {
@@ -101,7 +108,7 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
         budgetExhausted = true;
       }
       if (budgetExhausted) {
-        await finalize(deps, ctx, taskId, usage, startedAt, budgetNotes, true);
+        await finalize(deps, ctx, taskId, usage, settleWall, budgetNotes, true);
         return;
       }
 
@@ -152,6 +159,8 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
           });
         }
         messages.push({ role: "tool", content: toolBlocks });
+        settleWall();
+        db.updateTask(taskId, { usage: JSON.stringify(usage) });
         saveCheckpoint(deps, taskId, batch, messages, effectivePapers(ctx), usage, ctx.evidence);
         db.appendEvent(taskId, "progress", {
           step: usage.steps,
@@ -175,7 +184,8 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
       if (nudgedOnce) {
         notes.push("模型重试后仍未给出最终意见，以下结果由运行时按有效底稿整理。");
       }
-      // P1-2a：还有待核项且依赖的材料仍在处理且未超时 → 保存检查点转 waiting_index，等就绪/失败/截止再收尾
+      // P1-2 复核：待核项**或任务级缺口**依赖的材料仍在处理且未超时 → 转 waiting_index
+      // 释放执行槽（活跃等待记录持久化，调度器只按这些版本唤醒，不空转模型步数）
       await refreshStatusCache(ctx);
       const statsNow = coverageStats(effectivePapers(ctx));
       const timedOutNow = db.timedOutDocs(taskId, task.input_revision);
@@ -183,24 +193,29 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
         const cached = ctx.docStatusCache.get(`${m.doc_id}@${m.version}`);
         return cached && !cached.ready && ["uploaded", "parsing", "structuring", "indexing"].includes(cached.status) && !timedOutNow.has(`${m.doc_id}@${m.version}`);
       });
-      if (statsNow.pending > 0 && stillProcessing.length > 0) {
+      const hasOpenWork = statsNow.pending > 0 || statsNow.openTaskGaps.length > 0;
+      if (hasOpenWork && stillProcessing.length > 0) {
         for (const m of stillProcessing) {
           db.getOrCreateWait(taskId, task.input_revision, m.doc_id, m.version, config.waitingIndexTimeoutSeconds * 1000);
         }
+        // P2 复核：退出执行槽前把本批次已消耗的活动时长结算进持久化用量
+        settleWall();
+        db.updateTask(taskId, { usage: JSON.stringify(usage) });
         saveCheckpoint(deps, taskId, batch, messages, effectivePapers(ctx), usage, ctx.evidence);
         if (db.transitionTask(taskId, "running", "waiting_index")) {
           db.appendEvent(taskId, "progress", { note: `等待 ${stillProcessing.length} 份材料索引完成后继续` });
           return; // 释放执行槽
         }
       }
-      await finalize(deps, ctx, taskId, usage, startedAt, notes, false);
+      await finalize(deps, ctx, taskId, usage, settleWall, notes, false);
       return;
     }
   } catch (error) {
     if (error instanceof CancelledError || controller.signal.aborted) {
-      // 条件更新：仅 running 且属本批次时落取消（取消服务可能已先写入）
-      db.transitionTask(taskId, "running", "cancelled", { status_reason: "用户取消" });
-      db.appendEvent(taskId, "task_cancelled", {});
+      // 条件更新：仅 running 时落取消（取消服务可能已先写入）；只有成功方记录终态事件
+      if (db.transitionTask(taskId, "running", "cancelled", { status_reason: "用户取消" })) {
+        db.appendEvent(taskId, "task_cancelled", {});
+      }
     } else {
       // P1-3：异常也统一走判定——已核≥1 交付部分意见；零已核但已登记可独立阻断审核的材料缺口
       // 交付 insufficient；否则 no_valid_output → failed。不再绕过已登记的缺口。
@@ -209,7 +224,7 @@ export async function runTask(deps: RunnerDeps, taskId: string): Promise<void> {
         ctx,
         taskId,
         usage,
-        startedAt,
+        settleWall,
         [`执行异常：${(error as Error).message}。`],
         true,
       );
@@ -225,6 +240,15 @@ function effectivePapers(ctx: ToolContext): PapersDoc {
   return enforceActiveScope(ctx.papers, ctx.activeScope);
 }
 
+/** P1-7 复核：失败写入走条件转移（仅 running 可转 failed），取消获胜时不被覆盖；
+ * 仅由更新成功的一方记录终态事件。 */
+function failTask(db: Db, taskId: string, reason: string): void {
+  const truncated = reason.slice(0, 500);
+  if (db.transitionTask(taskId, "running", "failed", { status_reason: truncated })) {
+    db.appendEvent(taskId, "task_failed", { reason: truncated });
+  }
+}
+
 // ===== 成文与发布（设计 §5 / §4.4 发布竞态）=====
 
 async function finalize(
@@ -232,7 +256,7 @@ async function finalize(
   ctx: ToolContext,
   taskId: string,
   usage: TaskUsage,
-  startedAt: number,
+  settleWall: () => void,
   extraNotes: string[],
   executionBlocked: boolean,
 ): Promise<void> {
@@ -242,18 +266,23 @@ async function finalize(
   const materialIssues = buildMaterialIssues(ctx);
   const stats = coverageStats(papers);
 
-  // P1-1：凭据闸门——未成功加载 skill、或从未实际读到任何材料时，不发布实质合同意见
+  // P1-1 复核：凭据闸门覆盖所有实质核查项（含“未发现问题”的已核结论）
+  // - 有材料的任务：skill 未成功加载、或从未实际读到任何材料内容 → 已核项（checked>0）缺乏依据，不发布
+  // - 无材料的任务：任何实质发现（findings>0）都不可能有依据（写校验同样禁止 checked，双保险）
   const evidenceOk = ctx.evidence.skillLoaded && (ctx.materials.length === 0 || ctx.evidence.readDocs.size > 0);
-  if (stats.findings > 0 && !evidenceOk) {
+  const substanceUnsupported =
+    (ctx.materials.length > 0 && stats.checked > 0 && !evidenceOk) ||
+    (ctx.materials.length === 0 && stats.findings > 0);
+  if (substanceUnsupported) {
     const reason = !ctx.evidence.skillLoaded
-      ? "未成功加载绑定的 skill，发现的意见缺乏依据，不发布"
-      : "未实际读取任何材料内容，发现的意见缺乏依据，不发布";
-    db.updateTask(taskId, { status: "failed", status_reason: reason });
-    db.appendEvent(taskId, "task_failed", { reason });
+      ? "未成功加载绑定的 skill，已核结论缺乏依据，不发布"
+      : ctx.evidence.readDocs.size === 0
+        ? "未实际读取任何材料内容，已核结论缺乏依据，不发布"
+        : "本任务未绑定材料，不能存在实质发现";
+    failTask(db, taskId, reason);
     return;
   }
 
-  const timedOut = db.timedOutDocs(taskId, ctx.task.input_revision);
   // P1-3：只有**材料性**不可读才计入——扫描件、不可重试的解析失败；
   // 索引写入失败（可重试）与等待超时属技术原因，状态查询失败同理，均不能推出用户缺材料
   const clearlyUnreadable = (docId: string, version: number): boolean => {
@@ -266,27 +295,28 @@ async function finalize(
     }
     return false;
   };
-  void timedOut;
+  const materialUnreadableDocs = new Set(
+    ctx.materials.filter((m) => clearlyUnreadable(m.doc_id, m.version)).map((m) => `${m.doc_id}@${m.version}`),
+  );
   const allUnreadable = ctx.materials.length > 0 && ctx.materials.every((m) => clearlyUnreadable(m.doc_id, m.version));
 
   const outcome = determineOutcome(papers, {
     revisionMaterials: ctx.materials,
     materialIssues,
     allMaterialsUnreadable: allUnreadable,
+    materialUnreadableDocs,
   });
 
   if (outcome === "no_valid_output") {
     // v0.6 §4：无已证实的材料/事实缺口，也无可用审核结果 → failed（含空底稿/普通待执行/状态查询失败的情形）
     const reason = extraNotes[0] ?? "未产出有效审核结果（无已核项，也无已证实的材料或事实缺口）";
-    db.updateTask(taskId, { status: "failed", status_reason: reason.slice(0, 500) });
-    db.appendEvent(taskId, "task_failed", { reason });
+    failTask(db, taskId, reason);
     return;
   }
 
   // 执行故障/预算耗尽，既无可用实质审核结果、也无材料不足事实 → 任务失败（v0.6 §4 表末行）
   if (executionBlocked && stats.checked === 0 && stats.findings === 0 && outcome !== "insufficient_materials") {
-    db.updateTask(taskId, { status: "failed", status_reason: extraNotes[0] ?? "无可用审核结果" });
-    db.appendEvent(taskId, "task_failed", { reason: extraNotes[0] ?? "无可用审核结果" });
+    failTask(db, taskId, extraNotes[0] ?? "无可用审核结果");
     return;
   }
 
@@ -300,7 +330,7 @@ async function finalize(
     extraNotes,
   });
 
-  usage.wall_seconds = usage.wall_seconds + Math.round((Date.now() - startedAt) / 1000);
+  settleWall(); // P2 复核：发布前结算本批次活动时长增量
 
   // 发布事务：检查任务仍为有效批次、输入修订一致且未取消
   const published = db.transaction((): boolean => {
@@ -452,8 +482,11 @@ function restoreMessages(deps: RunnerDeps, ctx: ToolContext, task: TaskRow): Sto
 
   // P1-6：仅复用与当前输入修订一致的检查点；陈旧检查点（补件后未写新检查点）从头重建，
   // 已接纳的补充文字作为既定事实注入，旧待补问句只留作历史、不作为已核事实。
+  // P1-6 复核：复用的消息按新工具集过滤——旧协议的 request_input 调用与回执
+  // 从上下文剥离（旧问句已随迁移关闭，仅供历史查询）。
   if (checkpoint && checkpoint.input_revision === task.input_revision) {
-    return JSON.parse(checkpoint.messages) as StoredMessage[];
+    const messages = stripLegacyRequestInput(JSON.parse(checkpoint.messages) as StoredMessage[]);
+    return messages;
   }
   if (checkpoint) {
     db.appendEvent(task.task_id, "progress", {
@@ -479,9 +512,55 @@ function restoreMessages(deps: RunnerDeps, ctx: ToolContext, task: TaskRow): Sto
   ];
 }
 
-/** 恢复运行时凭据（P1-1）：优先取最近同修订检查点的 evidence；
- * 无则从当前底稿的 used_materials 重建（写入时已校验其必为实际读过的版本）。 */
-function restoreEvidence(db: Db, taskId: string, revision: number, papers: PapersDoc): { skillLoaded: boolean; readDocs: Set<string> } {
+/** 剥离旧协议（v0.5）的 request_input 调用与回执：assistant 的 toolCalls 过滤掉
+ * 该调用（过滤后既无文本也无调用则整条删除），tool 消息删除对应回执块（空则整条删除）。 */
+function stripLegacyRequestInput(messages: StoredMessage[]): StoredMessage[] {
+  const legacyCallIds = new Set<string>();
+  for (const message of messages) {
+    for (const call of message.toolCalls ?? []) {
+      if (call.name === "request_input") legacyCallIds.add(call.id);
+    }
+    if (Array.isArray(message.content)) {
+      for (const block of message.content as Array<Record<string, unknown>>) {
+        if (String(block.toolName ?? "") === "request_input") legacyCallIds.add(String(block.toolCallId));
+      }
+    }
+  }
+  if (legacyCallIds.size === 0) return messages;
+  const out: StoredMessage[] = [];
+  for (const message of messages) {
+    if (message.toolCalls?.some((call) => legacyCallIds.has(call.id))) {
+      const remainingCalls = message.toolCalls.filter((call) => !legacyCallIds.has(call.id));
+      const text = typeof message.content === "string" ? message.content : "";
+      if (remainingCalls.length === 0 && text.trim().length === 0) continue; // 整条删除
+      out.push({ ...message, content: text, toolCalls: remainingCalls.length > 0 ? remainingCalls : undefined });
+      continue;
+    }
+    if (message.role === "tool" && Array.isArray(message.content)) {
+      const blocks = (message.content as Array<Record<string, unknown>>).filter(
+        (block) => !legacyCallIds.has(String(block.toolCallId)),
+      );
+      if (blocks.length === 0) continue; // 整条删除
+      out.push({ ...message, content: blocks });
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
+/** 恢复运行时凭据（P1-1 复核）：优先取最近同修订检查点的 evidence 列；
+ * 旧检查点缺少凭据列时，**从消息中的成功工具回执重建**——skill 调用成功回执
+ * 证明加载，doc_read/doc_search/doc_outline 的回执仅在实际包含正文/片段/目录时
+ * 证明读取（与实时登记同一口径）。不再从底稿 used_materials 推定（那是待证结论本身）。 */
+function restoreEvidence(
+  db: Db,
+  taskId: string,
+  revision: number,
+  papers: PapersDoc,
+  messages?: StoredMessage[],
+): { skillLoaded: boolean; readDocs: Set<string> } {
+  void papers;
   const checkpoint = db.latestCheckpoint(taskId);
   if (checkpoint && checkpoint.evidence && checkpoint.input_revision === revision) {
     try {
@@ -491,13 +570,52 @@ function restoreEvidence(db: Db, taskId: string, revision: number, papers: Paper
       /* 损坏则走重建 */
     }
   }
-  const readDocs = new Set<string>();
-  for (const item of papers.items) {
-    for (const ref of item.used_materials) {
-      readDocs.add(`${ref.doc_id}@${ref.version}`);
+  const evidence = { skillLoaded: false, readDocs: new Set<string>() };
+  const history = messages ?? (checkpoint && checkpoint.input_revision === revision
+    ? stripLegacyRequestInput(JSON.parse(checkpoint.messages) as StoredMessage[])
+    : []);
+  // 调用 → 成功回执的配对（按 toolCallId）
+  const callsById = new Map<string, { name: string; input: Record<string, unknown> }>();
+  const resultsById = new Map<string, { isError?: boolean; output: unknown }>();
+  for (const message of history) {
+    for (const call of message.toolCalls ?? []) callsById.set(call.id, { name: call.name, input: (call.input ?? {}) as Record<string, unknown> });
+    if (Array.isArray(message.content)) {
+      for (const block of message.content as Array<Record<string, unknown>>) {
+        const id = String(block.toolCallId ?? "");
+        if (id) resultsById.set(id, { isError: block.isError === true, output: block.output });
+      }
     }
   }
-  return { skillLoaded: papers.items.length > 0 || papers.scope !== null, readDocs };
+  for (const [callId, call] of callsById) {
+    const result = resultsById.get(callId);
+    if (!result || result.isError) continue;
+    if (call.name === "skill") evidence.skillLoaded = true;
+    if (call.name === "doc_read") {
+      const blocks = (result.output as { blocks?: Array<unknown> } | null)?.blocks;
+      if (Array.isArray(blocks) && blocks.length > 0 && typeof call.input.doc_id === "string") {
+        const version = Number(call.input.version ?? 0);
+        if (version > 0) evidence.readDocs.add(`${call.input.doc_id}@${version}`);
+      }
+    }
+    if (call.name === "doc_search") {
+      const hits = (result.output as { hits?: Array<{ doc_id?: string; version?: number }> } | null)?.hits;
+      if (Array.isArray(hits)) {
+        for (const hit of hits) {
+          if (typeof hit.doc_id === "string" && typeof hit.version === "number") {
+            evidence.readDocs.add(`${hit.doc_id}@${hit.version}`);
+          }
+        }
+      }
+    }
+    if (call.name === "doc_outline") {
+      const items = (result.output as { items?: Array<unknown> } | null)?.items;
+      if (Array.isArray(items) && items.length > 0 && typeof call.input.doc_id === "string") {
+        const version = Number(call.input.version ?? 0);
+        if (version > 0) evidence.readDocs.add(`${call.input.doc_id}@${version}`);
+      }
+    }
+  }
+  return evidence;
 }
 
 function saveCheckpoint(
@@ -563,7 +681,7 @@ export function isFollowUpOnly(text: string): boolean {
   const compact = stripped.replace(/\s+/g, "");
   if (compact.length === 0) return false;
   // 问句 = 以 ？/? 结尾的片段（其余标点/换行为界）
-  const questionSegments = compact.match(/[^。！？!?；;\n]*[？?]/g) ?? [];
+  const questionSegments: string[] = compact.match(/[^。！？!?；;\n]*[？?]/g) ?? [];
   const questionChars = questionSegments.reduce((sum, s) => sum + s.length, 0);
   if (questionChars === 0) return false;
   // 问句里要有面向用户的祈使语气（请…）才算是追问；纯陈述性的设问不算

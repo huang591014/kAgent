@@ -19,7 +19,7 @@ export interface ActiveScope {
 }
 
 export type PapersValidation =
-  | { ok: true; papers: PapersDoc; scopeChanged: boolean }
+  | { ok: true; papers: PapersDoc; scopeChanged: boolean; scopeExtended: boolean }
   | { ok: false; errors: string[] };
 
 const ITEM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -67,8 +67,10 @@ export function validatePapers(
   }
 
   // 与运行时保存的活动范围核对：按规则卡身份识别路由——
-  // 同一张卡不允许删减已登记的预期项（即使附理由）；规则卡变化才是路由变化，需要材料依据。
+  // 同一张卡不允许删减已登记的预期项（即使附理由），同卡新增检查项是合法扩展（原子更新范围）；
+  // 规则卡变化才是路由变化，需要材料依据。
   let scopeChanged = false;
+  let scopeExtended = false;
   const scopeChangeReason = optionalString(raw.scope_change_reason);
   if (activeScope) {
     if (!scope) {
@@ -82,6 +84,8 @@ export function validatePapers(
             `同一张规则卡不允许删减已登记的预期检查项（被删除：${removed.join("、")}）。` +
               "该项应更新为对应状态（checked/pending/not_applicable），或作为路由变化登记新的规则卡并说明依据。",
           );
+        } else if (scope.expected_item_ids.length > activeScope.expected_item_ids.length) {
+          scopeExtended = true; // 同卡发现更多检查项：允许，运行时原子扩展活动范围
         }
       } else if (!scopeChangeReason) {
         errors.push(
@@ -212,13 +216,23 @@ export function validatePapers(
     }
   }
 
-  // 任务级缺口（v0.6 §4）：可落在整个任务，随底稿持久化；doc 引用须在修订内
+  // 任务级缺口（v0.6 §4）：可落在整个任务，随底稿持久化；doc 引用须在修订内。
+  // P1-4 复核：存在未解决缺口时，省略 task_gaps 或传 null 同样被拒——
+  // 旧缺口核对不再依赖“新字段是数组”的分支。
   const taskGaps: TaskGap[] = [];
   const rawGaps = raw.task_gaps;
-  if (rawGaps !== null && rawGaps !== undefined) {
-    if (!Array.isArray(rawGaps)) {
+  const hasUnresolvedPrevious = previousTaskGaps.some((g) => g.resolved !== true);
+  if (rawGaps === null || rawGaps === undefined || !Array.isArray(rawGaps)) {
+    if (rawGaps !== null && rawGaps !== undefined) {
       errors.push("task_gaps 必须是数组");
-    } else {
+    }
+    if (hasUnresolvedPrevious) {
+      errors.push(
+        "底稿存在未解决的任务级缺口，写入不能省略 task_gaps 字段（或传 null）：" +
+          "请保留全部缺口记录，解决须显式标记 resolved=true 及 resolved_reason。",
+      );
+    }
+  } else {
       const seenGapIds = new Set<string>();
       for (const [index, entry] of (rawGaps as unknown[]).entries()) {
         if (typeof entry !== "object" || entry === null) {
@@ -278,7 +292,6 @@ export function validatePapers(
           );
         }
       }
-    }
   }
 
   let conclusionHint: string | null = null;
@@ -296,6 +309,7 @@ export function validatePapers(
     ok: true,
     papers: { scope, items: parsedItems, task_gaps: taskGaps, conclusion_hint: conclusionHint },
     scopeChanged,
+    scopeExtended,
   };
 }
 

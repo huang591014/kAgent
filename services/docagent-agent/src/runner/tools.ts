@@ -222,20 +222,26 @@ function runWriteFile(filePath: string, content: string, ctx: ToolContext): Tool
         errors: validation.errors,
       });
     }
-    // P1-1：凭据校验——引用的文件版本必须实际成功读过；有材料时实质发现必须引用读过文件
+    // P1-1 复核：凭据校验覆盖每个依赖材料的实质核查项（含"未发现问题"）
     const evidenceErrors: string[] = [];
     for (const item of validation.papers.items) {
       if (item.status !== "checked") continue;
+      if (ctx.materials.length === 0) {
+        evidenceErrors.push(
+          `${item.item_id}：本任务未绑定任何材料，不能登记已核项（checked）——没有可依据的合同内容。`,
+        );
+        continue;
+      }
       for (const ref of item.used_materials) {
         if (!ctx.evidence.readDocs.has(`${ref.doc_id}@${ref.version}`)) {
           evidenceErrors.push(
-            `${item.item_id} 引用了未实际读取的材料版本 ${ref.doc_id}@${ref.version}：先用 doc_search / doc_read / doc_outline 读取后再引用。`,
+            `${item.item_id} 引用了未实际读取的材料版本 ${ref.doc_id}@${ref.version}：先用 doc_search / doc_read / doc_outline 取得实际正文后再引用。`,
           );
         }
       }
-      if (item.finding && item.used_materials.length === 0 && ctx.materials.length > 0) {
+      if (item.used_materials.length === 0) {
         evidenceErrors.push(
-          `${item.item_id} 登记了实质发现但未引用任何材料版本：依赖合同内容的结论必须把实际读过的文件记入 used_materials。`,
+          `${item.item_id} 已核但未引用任何材料版本：每个依赖合同内容的核查项（无论是否发现问题）都必须把实际读过的文件记入 used_materials。`,
         );
       }
     }
@@ -245,11 +251,13 @@ function runWriteFile(filePath: string, content: string, ctx: ToolContext): Tool
         errors: evidenceErrors,
       });
     }
-    // 首次确定路径或路由变化：把范围独立保存到运行时存储（分母不随底稿文件漂移）
-    if (validation.papers.scope && (!ctx.activeScope || validation.scopeChanged)) {
+    // 首次确定路径、路由变化或同卡扩展：把范围原子保存到运行时存储（分母不随底稿文件漂移）
+    if (validation.papers.scope && (!ctx.activeScope || validation.scopeChanged || validation.scopeExtended)) {
       const reason = validation.scopeChanged
         ? String((parsed as Record<string, unknown>).scope_change_reason ?? "route-change")
-        : "initial";
+        : validation.scopeExtended
+          ? "same-card-extended"
+          : "initial";
       ctx.db.saveActiveScope(ctx.task.task_id, ctx.task.input_revision, {
         rule_cards: validation.papers.scope.rule_cards,
         expected_item_ids: validation.papers.scope.expected_item_ids,
@@ -312,7 +320,9 @@ async function runDocOutline(docId: string, version: number | undefined, ctx: To
   );
   if (!target) throw new Error(`材料不在当前输入修订：${docId}`);
   const outline = await pipeline.outline(ctx.identity, docId, target.version);
-  ctx.evidence.readDocs.add(`${docId}@${target.version}`); // P1-1：目录读取成功即证据
+  if (outline.items.length > 0) {
+    ctx.evidence.readDocs.add(`${docId}@${target.version}`); // P1-1 复核：目录非空才算读取证据
+  }
   // 目录项裁剪，避免过长
   return {
     doc_id: docId,
@@ -366,7 +376,9 @@ async function runDocRead(args: Record<string, unknown>, ctx: ToolContext) {
   });
   const key = `${docId}@${version ?? ctx.materials.find((m) => m.doc_id === docId)?.version ?? 0}`;
   const cached = ctx.docStatusCache.get(key);
-  ctx.evidence.readDocs.add(key); // P1-1：实际回读成功
+  if (result.blocks.length > 0) {
+    ctx.evidence.readDocs.add(key); // P1-1 复核：只有实际返回可用正文的回读才算证据，空回读不算
+  }
   return {
     blocks: result.blocks,
     next_cursor: result.next_cursor,

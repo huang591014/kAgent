@@ -94,23 +94,25 @@ export function fitMessagesToBudget(
         i += 1;
       }
     }
-    // 从最旧的组开始丢，直到满足预算或只剩最后一组
+    // 从最旧的组开始丢，直到满足预算或只剩最后一组；省略标记本身计入预算（P1-9 复核）
+    const omissionMarker = {
+      role: "user" as const,
+      content:
+        "[更早的工具往返因长度策略已省略（底稿写入等）；关键事实与进度以 working-papers.json 为准，需要原文请用检索工具重新读取]",
+    };
+    const markerTokens = messageTokens(omissionMarker);
     let acc = total;
     let dropUpto = safeStart; // 丢弃 [safeStart, dropUpto)
     for (const group of groups) {
       if (group.end >= messages.length) break; // 至少保留最后一组
       acc -= messages.slice(group.start, group.end).reduce((sum, m) => sum + messageTokens(m), 0);
       dropUpto = group.end;
-      if (acc <= budget) break;
+      if (acc + markerTokens <= budget) break;
     }
     if (dropUpto > safeStart) {
       dropped = dropUpto - safeStart;
       const kept = messages.slice(0, safeStart).concat(messages.slice(dropUpto));
-      kept.splice(safeStart, 0, {
-        role: "user",
-        content:
-          "[更早的工具往返因长度策略已省略（底稿写入等）；关键事实与进度以 working-papers.json 为准，需要原文请用检索工具重新读取]",
-      });
+      kept.splice(safeStart, 0, omissionMarker);
       return { messages: kept, dropped, truncatedToolResults: truncated };
     }
   }

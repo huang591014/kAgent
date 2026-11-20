@@ -7,7 +7,7 @@ const materials = [
   { doc_id: "d_02", version: 1, label: "采购纪要.docx", role: "纪要" },
 ];
 
-const item = (overrides: Record<string, unknown> = {}) => ({
+const item = (overrides: Partial<import("../src/types.js").PaperItem> = {}): import("../src/types.js").PaperItem => ({
   item_id: "item-1",
   rule_card: "C6 付款与发票",
   status: "checked",
@@ -26,6 +26,7 @@ describe("determineOutcome", () => {
   it("全部适用项已核 → complete", () => {
     const papers: PapersDoc = {
       scope: { rule_cards: ["C6"], expected_item_ids: ["item-1"] },
+      task_gaps: [],
       conclusion_hint: null,
       items: [item()],
     };
@@ -35,6 +36,7 @@ describe("determineOutcome", () => {
   it("存在待核 → partial（即使有已核项）", () => {
     const papers: PapersDoc = {
       scope: { rule_cards: ["C6"], expected_item_ids: ["item-1", "item-2"] },
+      task_gaps: [],
       conclusion_hint: null,
       items: [
         item(),
@@ -45,7 +47,7 @@ describe("determineOutcome", () => {
   });
 
   it("主合同不可读、无任何已核 → insufficient_materials", () => {
-    const papers: PapersDoc = { scope: null, conclusion_hint: null, items: [] };
+    const papers: PapersDoc = { scope: null, conclusion_hint: null, task_gaps: [], items: [] };
     expect(
       determineOutcome(papers, {
         revisionMaterials: materials,
@@ -70,8 +72,8 @@ describe("determineOutcome", () => {
   it("纯文本 pending_reason 不再构成缺材料证据（技术原因文本 → no_valid_output）", () => {
     const papers: PapersDoc = {
       scope: null,
-      conclusion_hint: null,
       task_gaps: [],
+      conclusion_hint: null,
       items: [item({ status: "pending", finding: null, pending_reason: "执行预算已耗尽" })],
     };
     expect(determineOutcome(papers, { revisionMaterials: materials, materialIssues: [] })).toBe("no_valid_output");
@@ -80,6 +82,7 @@ describe("determineOutcome", () => {
   it("全部不适用且各有理由 → complete", () => {
     const papers: PapersDoc = {
       scope: { rule_cards: ["C6"], expected_item_ids: ["item-1"] },
+      task_gaps: [],
       conclusion_hint: null,
       items: [item({ status: "not_applicable", finding: null, not_applicable_reason: "本合同不涉及付款环节" })],
     };
@@ -91,6 +94,7 @@ describe("composeConclusion", () => {
   it("partial：交付发现 + 未能核查事项 + 范围摘要", () => {
     const papers: PapersDoc = {
       scope: { rule_cards: ["C6 付款"], expected_item_ids: ["item-1", "item-2"] },
+      task_gaps: [],
       conclusion_hint: null,
       items: [
         item(),
@@ -115,6 +119,7 @@ describe("composeConclusion", () => {
   it("complete 且无发现：必须写明“未发现问题”并附范围摘要", () => {
     const papers: PapersDoc = {
       scope: { rule_cards: ["C6"], expected_item_ids: ["item-1"] },
+      task_gaps: [],
       conclusion_hint: null,
       items: [item({ finding: null, used_materials: [{ doc_id: "d_01", version: 1 }] })],
     };
@@ -131,6 +136,7 @@ describe("composeConclusion", () => {
   it("insufficient：列出缺口与所需材料", () => {
     const papers: PapersDoc = {
       scope: null,
+      task_gaps: [],
       conclusion_hint: null,
       items: [],
     };
@@ -150,6 +156,7 @@ describe("composeConclusion", () => {
   it("conclusion_hint 优先于推导口径", () => {
     const papers: PapersDoc = {
       scope: { rule_cards: ["C6"], expected_item_ids: ["item-1"] },
+      task_gaps: [],
       conclusion_hint: "拟同意",
       items: [item({ finding: null })],
     };

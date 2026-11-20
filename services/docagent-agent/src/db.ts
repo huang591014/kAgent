@@ -326,7 +326,7 @@ export class Db {
   getTask(taskId: string): TaskRow | undefined {
     return this.db
       .prepare("SELECT * FROM tasks WHERE task_id = ?")
-      .get(taskId) as TaskRow | undefined;
+      .get(taskId) as unknown as TaskRow | undefined;
   }
 
   updateTask(taskId: string, patch: Partial<TaskRow>): void {
@@ -374,19 +374,19 @@ export class Db {
   getRequest(requestId: string): InputRequestRow | undefined {
     return this.db
       .prepare("SELECT * FROM input_requests WHERE request_id = ?")
-      .get(requestId) as InputRequestRow | undefined;
+      .get(requestId) as unknown as InputRequestRow | undefined;
   }
 
   getRequestByToolCall(taskId: string, toolCallId: string): InputRequestRow | undefined {
     return this.db
       .prepare("SELECT * FROM input_requests WHERE task_id = ? AND tool_call_id = ?")
-      .get(taskId, toolCallId) as InputRequestRow | undefined;
+      .get(taskId, toolCallId) as unknown as InputRequestRow | undefined;
   }
 
   openRequest(taskId: string): InputRequestRow | undefined {
     return this.db
       .prepare("SELECT * FROM input_requests WHERE task_id = ? AND status = 'open' ORDER BY seq DESC LIMIT 1")
-      .get(taskId) as InputRequestRow | undefined;
+      .get(taskId) as unknown as InputRequestRow | undefined;
   }
 
   countRequests(taskId: string): number {
@@ -437,7 +437,7 @@ export class Db {
   latestCheckpoint(taskId: string): CheckpointRow | undefined {
     return this.db
       .prepare("SELECT * FROM checkpoints WHERE task_id = ? ORDER BY created_at DESC, step_no DESC LIMIT 1")
-      .get(taskId) as CheckpointRow | undefined;
+      .get(taskId) as unknown as CheckpointRow | undefined;
   }
 
   /** 已接纳的补充文字（按修订序，≤ maxRevision）——v0.5 升级任务恢复上下文用（P1-6）。 */
@@ -521,6 +521,13 @@ export class Db {
     return new Set(rows.map((r) => `${r.doc_id}@${r.version}`));
   }
 
+  /** 本修订的活跃等待记录（未决出结果）——调度唤醒只看这些版本（P1-2 复核）。 */
+  listActiveWaits(taskId: string, revision: number): Array<{ doc_id: string; version: number; deadline: number }> {
+    return this.db
+      .prepare("SELECT doc_id, version, deadline FROM index_waits WHERE task_id = ? AND input_revision = ? AND decided IS NULL")
+      .all(taskId, revision) as Array<{ doc_id: string; version: number; deadline: number }>;
+  }
+
   // ===== task workspace files =====
   getFile(taskId: string, path: string): { content: string; updated_at: number } | undefined {
     return this.db
@@ -556,7 +563,7 @@ export class Db {
   }
 
   getSkill(ref: string): SkillRow | undefined {
-    return this.db.prepare("SELECT * FROM skills WHERE ref = ?").get(ref) as SkillRow | undefined;
+    return this.db.prepare("SELECT * FROM skills WHERE ref = ?").get(ref) as unknown as SkillRow | undefined;
   }
 
   listSkills(): SkillRow[] {

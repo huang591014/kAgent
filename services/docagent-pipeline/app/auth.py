@@ -51,11 +51,12 @@ def resolve_identity(
 
 def ensure_doc_access(identity: Identity, doc: dict) -> None:
     """普通用户（含 agent 代查的被代理身份）只访问自己上传的材料；
-    管理员按管理范围（M1：租户内全部）可见。internal 身份不再获得管理范围。"""
+    管理员按管理范围（M1：租户内全部）可见——internal 调用的管理员标志来自
+    agent 转发的任务提交者身份（服务密钥 + 同租户双重校验后可信），同样放行。"""
     if doc.get("tenant_id") != identity.tenant_id:
         raise HTTPException(status_code=404, detail="doc not found")
     if doc.get("uploaded_by") == identity.user_id:
         return
-    if not identity.is_internal and identity.is_admin:
+    if identity.is_admin:
         return
     raise HTTPException(status_code=403, detail="doc not accessible")
