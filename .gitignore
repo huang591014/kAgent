@@ -5,6 +5,9 @@ docagent-m1-remediation.md
 # 本地文档与环境（含中间件配置，不入库）
 docs/
 
+# Skill 分发内容（本地保留，不入库，含各版本分发包）
+合规审核Skill-分发包*/
+
 # Skill 分发内容（本地保留，不入库）
 合规审核Skill-分发包/
 
